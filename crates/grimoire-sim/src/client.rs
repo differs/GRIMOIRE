@@ -233,11 +233,16 @@ fn now_ms() -> u32 {
 impl UdpKcp {
     /// 绑定 KCP 会话：首包即建立网关侧会话。
     pub async fn bind(gateway_udp: &str, conn_id: u32) -> anyhow::Result<Self> {
+        Self::bind_with(gateway_udp, conn_id, 10, 2, true).await
+    }
+
+    /// 绑定 KCP 会话（自定义参数：间隔 ms / 快重传 / 流控）。
+    pub async fn bind_with(gateway_udp: &str, conn_id: u32, interval: i32, resend: i32, nc: bool) -> anyhow::Result<Self> {
         let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
         let addr: std::net::SocketAddr = gateway_udp.parse()?;
         let output = UdpKcpOutput { sock: sock.clone(), addr };
         let mut kcp = kcp::Kcp::new(conn_id, output);
-        kcp.set_nodelay(true, 10, 2, true);
+        kcp.set_nodelay(true, interval, resend, nc);
         kcp.set_wndsize(128, 128);
         let kcp = Arc::new(std::sync::Mutex::new(kcp));
 

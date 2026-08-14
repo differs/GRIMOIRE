@@ -37,6 +37,15 @@ struct Args {
     /// 注册中心地址
     #[arg(long, default_value = "127.0.0.1:8500")]
     registry: String,
+    /// KCP 刷新间隔(ms)
+    #[arg(long, default_value = "10")]
+    kcp_interval: i32,
+    /// KCP 快重传次数
+    #[arg(long, default_value = "2")]
+    kcp_resend: i32,
+    /// KCP 关闭流控(纯快传模式)
+    #[arg(long, default_value = "true")]
+    kcp_nc: bool,
 }
 
 /// gRPC 侧：业务服务主动 push/kick 到客户端连接
@@ -105,6 +114,9 @@ async fn main() -> anyhow::Result<()> {
         udp_tx,
         kcp_sessions: Arc::new(DashMap::new()),
         udp_sock: udp_sock.clone(),
+        kcp_interval: args.kcp_interval,
+        kcp_resend: args.kcp_resend,
+        kcp_nc: args.kcp_nc,
     });
 
     // 注册到注册中心（多活网关按 id 区分）

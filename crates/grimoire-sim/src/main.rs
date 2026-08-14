@@ -17,7 +17,6 @@ use clap::Parser;
 use client::{dec, enc, Client, UdpBattle, UdpKcp};
 use grimoire_common::msg;
 use grimoire_pb::pb::*;
-use tokio::sync::mpsc;
 use tracing::info;
 
 #[derive(Parser)]
@@ -47,6 +46,12 @@ struct Args {
     /// 每连接并发的在途请求数（管线）；>1 测吞吐天花板
     #[arg(long, default_value = "1")]
     pipeline: u32,
+    /// KCP 刷新间隔(ms)（battle-stress 用）
+    #[arg(long, default_value = "10")]
+    kcp_interval: i32,
+    /// KCP 快重传次数（battle-stress 用）
+    #[arg(long, default_value = "2")]
+    kcp_resend: i32,
 }
 
 #[tokio::main]
@@ -367,6 +372,8 @@ async fn battle_stress_demo(args: &Args) -> Result<()> {
     let dur = args.duration;
     let udp_a = args.udp_gateway.clone();
     let udp_b = args.udp_gateway_b.clone();
+    let kcp_interval = args.kcp_interval;
+    let kcp_resend = args.kcp_resend;
     let mut handles = Vec::new();
     for (i, c) in clients.into_iter().enumerate() {
         let cid = c.wait_conn_id().await;
@@ -374,7 +381,7 @@ async fn battle_stress_demo(args: &Args) -> Result<()> {
         handles.push(tokio::spawn(async move {
             // 持有客户端以保持 TCP 连接存活（Drop 会关闭连接导致被踢出战斗）
             let _keep_client = c;
-            let Ok(kcp) = UdpKcp::bind(&udp, cid).await else {
+            let Ok(kcp) = UdpKcp::bind_with(&udp, cid, kcp_interval, kcp_resend, true).await else {
                 info!("client {} kcp bind fail", cid);
                 return (0u64, 0u64, Duration::ZERO);
             };
@@ -382,6 +389,8 @@ async fn battle_stress_demo(args: &Args) -> Result<()> {
             let mut prev = 0u64;
             let mut gaps = 0u64;
             let mut sum_lat = Duration::ZERO;
+            let mut min_int = Duration::MAX;
+            let mut max_int = Duration::ZERO;
             let mut last_recv = Instant::now();
             let deadline = tokio::time::sleep(Duration::from_secs(dur));
             tokio::pin!(deadline);
@@ -408,7 +417,12 @@ async fn battle_stress_demo(args: &Args) -> Result<()> {
                                 frames += 1;
                                 if prev != 0 && p.frame != prev + 1 { gaps += 1; }
                                 prev = p.frame;
-                                if frames > 1 { sum_lat += t0.duration_since(last_recv); }
+                                if frames > 1 {
+                                    let iv = t0.duration_since(last_recv);
+                                    sum_lat += iv;
+                                    if iv < min_int { min_int = iv; }
+                                    if iv > max_int { max_int = iv; }
+                                }
                                 last_recv = t0;
                             }
                         }
@@ -416,7 +430,7 @@ async fn battle_stress_demo(args: &Args) -> Result<()> {
                 }
             }
             input.abort();
-            info!("client {} kcp frames={} gaps={} last_frame={}", cid, frames, gaps, prev);
+            info!("client {} kcp frames={} gaps={} min_int={:?} max_int={:?}", cid, frames, gaps, min_int, max_int);
             (frames, gaps, sum_lat)
         }));
     }
@@ -583,27 +597,35 @@ async fn room_migrate_demo(args: &Args) -> Result<()> {
 /// pipeline=1 时 QPS ≈ 连接数/RTT（测延迟）；pipeline>1 时绕开 RTT 限制，
 /// 直接压出服务器真实吞吐上限。
 async fn bench(args: &Args) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering as AtOrder};
+    use std::sync::Arc;
     let pipeline = args.pipeline.max(1);
     info!(
         "=== bench {} clients x {}s, pipeline={} on {} (msg=RoomList) ===",
         args.clients, args.duration, pipeline, args.gateway
     );
-    let (tx, mut rx) = mpsc::channel::<(u64, Duration)>(args.clients * pipeline as usize * 100);
+    // 每个 worker 本地计数（无共享争用）；延迟按 1/100 采样
+    let lats = Arc::new(tokio::sync::Mutex::new(Vec::<Duration>::new()));
+    let mut handles = Vec::new();
+    let mut counters = Vec::new();
 
     for i in 0..args.clients {
         let gw = args.gateway.clone();
         let Ok(c) = Client::connect(&gw, i as u32).await else { continue };
         for _ in 0..pipeline {
-            let tx = tx.clone();
             let c = c.clone();
+            let lats = lats.clone();
+            let counter = Arc::new(AtomicU64::new(0));
+            counters.push(counter.clone());
             // 限速仅用于 pipeline=1 的向后兼容场景
             let interval = if pipeline == 1 && args.rps > 0 {
                 Some(tokio::time::interval(Duration::from_micros(1_000_000 / args.rps.max(1))))
             } else {
                 None
             };
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 let mut interval = interval;
+                let mut n = 0u64;
                 loop {
                     if let Some(iv) = &mut interval {
                         iv.tick().await;
@@ -612,26 +634,30 @@ async fn bench(args: &Args) -> Result<()> {
                     let r = c.request(msg::ROOM_LIST, vec![]).await;
                     let lat = start.elapsed();
                     if r.is_ok() {
-                        if tx.send((1, lat)).await.is_err() {
-                            return;
+                        n += 1;
+                        counter.fetch_add(1, AtOrder::Relaxed);
+                        // 采样：每 100 个锁一次共享 lats，降低聚合开销
+                        if n % 100 == 0 {
+                            lats.lock().await.push(lat);
                         }
                     }
                 }
-            });
+            }));
         }
     }
-    drop(tx);
 
-    let deadline = Instant::now() + Duration::from_secs(args.duration);
-    let mut total = 0u64;
-    let mut lats: Vec<Duration> = Vec::new();
-    while let Some((_, lat)) = rx.recv().await {
-        if Instant::now() > deadline {
-            break;
-        }
-        total += 1;
-        lats.push(lat);
+    tokio::time::sleep(Duration::from_secs(args.duration)).await;
+    for h in &handles {
+        h.abort();
     }
+    drop(handles);
+
+    // 聚合：worker 本地计数直接读取
+    let total: u64 = counters.iter().map(|c| c.load(AtOrder::Relaxed)).sum();
+    let mut lats = {
+        let mut l = lats.lock().await;
+        std::mem::take(&mut *l)
+    };
 
     let elapsed = args.duration as f64;
     let qps = total as f64 / elapsed;
@@ -644,8 +670,8 @@ async fn bench(args: &Args) -> Result<()> {
         lats[idx.clamp(1, lats.len()) - 1]
     };
     info!(
-        "total={} qps={:.0} avg={:?} p50={:?} p99={:?}",
-        total, qps, lats.iter().sum::<Duration>() / lats.len().max(1) as u32, p(0.50), p(0.99)
+        "total={} qps={:.0} avg={:?} p50={:?} p99={:?} (采样数 {})",
+        total, qps, lats.iter().sum::<Duration>() / lats.len().max(1) as u32, p(0.50), p(0.99), lats.len()
     );
     Ok(())
 }

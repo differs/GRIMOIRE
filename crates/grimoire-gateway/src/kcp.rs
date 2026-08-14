@@ -37,11 +37,11 @@ pub struct KcpSession {
 }
 
 impl KcpSession {
-    pub fn new(conv: u32, sock: Arc<UdpSocket>, addr: SocketAddr) -> Arc<Self> {
+    pub fn new(conv: u32, sock: Arc<UdpSocket>, addr: SocketAddr, interval: i32, resend: i32, nc: bool) -> Arc<Self> {
         let output = UdpOutput { sock, addr };
         let mut kcp = Kcp::new(conv, output);
-        // nodelay: 快速模式（10ms 间隔、2 次快重传、无流控）
-        kcp.set_nodelay(true, 10, 2, true);
+        // nodelay: 低延迟模式（interval ms 间隔、resend 次快重传、可选流控）
+        kcp.set_nodelay(true, interval, resend, nc);
         kcp.set_wndsize(128, 128);
         Arc::new(Self { inner: std::sync::Mutex::new(kcp) })
     }

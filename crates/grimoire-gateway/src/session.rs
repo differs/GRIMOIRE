@@ -1,6 +1,5 @@
 //! 客户端连接会话：读写循环、请求转发、UDP 绑定、清理。
 
-use std::collections::HashSet;
 use std::time::Duration;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -38,12 +37,17 @@ pub struct Ctx {
     pub kcp_sessions: Arc<DashMap<u32, Arc<KcpSession>>>,
     /// UDP socket（KCP 新建会话/输出用）
     pub udp_sock: Arc<tokio::net::UdpSocket>,
+    /// KCP 参数
+    pub kcp_interval: i32,
+    pub kcp_resend: i32,
+    pub kcp_nc: bool,
 }
 
 pub struct Session {
     conn_id: AtomicU32,
     tx: mpsc::Sender<Frame>,
-    active_domains: Mutex<HashSet<u32>>,
+    /// 已激活玩法域位掩码（bit = domain>>24），原子操作，热路径无锁
+    active_domains: AtomicU32,
     /// 客户端 UDP 源地址（首次收到其 UDP 包时绑定）
     udp_addr: Mutex<Option<SocketAddr>>,
 }
@@ -53,7 +57,7 @@ impl Session {
         Arc::new(Self {
             conn_id: AtomicU32::new(conn_id),
             tx,
-            active_domains: Mutex::new(HashSet::new()),
+            active_domains: AtomicU32::new(0),
             udp_addr: Mutex::new(None),
         })
     }
@@ -66,21 +70,23 @@ impl Session {
     /// 同时清空玩法域记录，令首个请求重新触发 PlayerConnected 通知。
     pub async fn rebind(&self, new_id: u32) {
         self.conn_id.store(new_id, Ordering::Relaxed);
-        self.active_domains.lock().await.clear();
+        self.active_domains.store(0, Ordering::Relaxed);
     }
 
     pub async fn send(&self, f: Frame) -> bool {
         self.tx.send(f).await.is_ok()
     }
 
-    /// 首次访问某玩法域时记录，用于断开时定向通知。
-    async fn mark_domain(&self, domain: u32) -> bool {
-        let mut d = self.active_domains.lock().await;
-        d.insert(domain)
+    /// 首次访问某玩法域时记录（原子位掩码，无锁），返回是否为新激活。
+    fn mark_domain(&self, domain: u32) -> bool {
+        let bit = 1u32 << ((domain >> 24) & 0x1F);
+        let prev = self.active_domains.fetch_or(bit, Ordering::Relaxed);
+        (prev & bit) == 0
     }
 
-    pub async fn domains(&self) -> Vec<u32> {
-        self.active_domains.lock().await.iter().copied().collect()
+    pub fn domains(&self) -> Vec<u32> {
+        let bits = self.active_domains.load(Ordering::Relaxed);
+        (1..=3).filter(|d| bits & (1 << d) != 0).map(|d| d << 24).collect()
     }
 
     pub async fn bind_udp(&self, addr: SocketAddr) {
@@ -193,7 +199,7 @@ pub async fn accept_and_serve(ctx: Arc<Ctx>, stream: TcpStream, peer: SocketAddr
 
     // 连接结束：立即通知业务服务断开（服务端有宽限恢复），
     // 但会话表保留 SESSION_GRACE 秒供连接迁移重绑。
-    let domains = session.domains().await;
+    let domains = session.domains();
     debug!("conn {} closed, notifying domains {:?}", conn_id, domains);
     let c = ctx.clone();
     tokio::spawn(async move {
@@ -272,9 +278,9 @@ async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
     let result: Result<(), String> = async {
         let svc_name = crate::discovery::service_for_domain(domain)
             .ok_or_else(|| format!("unknown domain 0x{:X}", domain))?;
-        let node = ctx.discovery.resolve(domain).await.ok_or_else(|| format!("no {} available", svc_name))?;
+        let node = ctx.discovery.resolve(domain, Some(session.conn_id())).await.ok_or_else(|| format!("no {} available", svc_name))?;
         // 首次进入该玩法域时通知业务服务（低频，unary 即可）
-        if session.mark_domain(domain).await {
+        if session.mark_domain(domain) {
             if let Some(ch) = ctx.discovery.channel_for(&node.addr).await {
                 let mut client = ServiceBridgeClient::new(ch);
                 let _ = client.player_connected(PlayerEvent { conn_id: session.conn_id() }).await;
@@ -343,7 +349,7 @@ pub async fn handle_kcp_datagram(ctx: Arc<Ctx>, conv: u32, src: SocketAddr, data
     let session = match ctx.kcp_sessions.get(&conv) {
         Some(s) => s.clone(),
         None => {
-            let s = KcpSession::new(conv, ctx.udp_sock.clone(), src);
+            let s = KcpSession::new(conv, ctx.udp_sock.clone(), src, ctx.kcp_interval, ctx.kcp_resend, ctx.kcp_nc);
             ctx.kcp_sessions.insert(conv, s.clone());
             // driver 收到会话内数据后回调处理
             let c = ctx.clone();
@@ -373,11 +379,11 @@ async fn forward_udp(ctx: Arc<Ctx>, session: Arc<Session>, msg_id: u32, payload:
     let Ok(svc_name) = crate::discovery::service_for_domain(domain).ok_or_else(|| "unknown domain") else {
         return;
     };
-    let Some(node) = ctx.discovery.resolve(domain).await else {
+    let Some(node) = ctx.discovery.resolve(domain, Some(session.conn_id())).await else {
         warn!("udp forward: no {} available", svc_name);
         return;
     };
-    if session.mark_domain(domain).await {
+    if session.mark_domain(domain) {
         if let Some(ch) = ctx.discovery.channel_for(&node.addr).await {
             let mut client = ServiceBridgeClient::new(ch);
             let _ = client.player_connected(PlayerEvent { conn_id: session.conn_id() }).await;
@@ -398,7 +404,7 @@ async fn forward_udp(ctx: Arc<Ctx>, session: Arc<Session>, msg_id: u32, payload:
 }
 
 async fn notify_disconnected(ctx: &Ctx, domain: u32, conn_id: u32) {
-    let Some(node) = ctx.discovery.resolve(domain).await else { return };
+    let Some(node) = ctx.discovery.resolve(domain, Some(conn_id)).await else { return };
     let Some(ch) = ctx.discovery.channel_for(&node.addr).await else { return };
     let mut client = ServiceBridgeClient::new(ch);
     if let Err(e) = client.player_disconnected(PlayerEvent { conn_id }).await {
