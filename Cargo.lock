@@ -883,6 +883,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-stream",
  "tonic 0.12.3",
  "tracing",
 ]

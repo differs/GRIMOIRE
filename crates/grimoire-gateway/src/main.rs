@@ -57,21 +57,40 @@ struct GatewayGrpc {
 impl GatewayService for GatewayGrpc {
     async fn push(&self, request: Request<PushRequest>) -> Result<Response<PushReply>, Status> {
         let req = request.into_inner();
-        // 先把 Arc 克隆出 Ref 再 await，避免 Ref 跨 await 持有分片读锁
-        let ok = match self.ctx.sessions.get(&req.conn_id).map(|r| r.clone()) {
-            Some(s) => {
-                debug!("push conn {} msg 0x{:X} udp={}", req.conn_id, req.msg_id, req.udp);
-                s.push_msg(&self.ctx, req.msg_id, req.payload.into(), req.udp).await
-            }
-            None => {
-                warn!("push conn {} not found", req.conn_id);
-                false
-            }
-        };
+        let ok = route_push(&self.ctx, req.clone()).await;
         if !ok {
             warn!("push to conn {} failed", req.conn_id);
         }
         Ok(Response::new(PushReply { ok }))
+    }
+
+    type PushStreamStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<PushReply, Status>> + Send>,
+    >;
+
+    /// 双向流式推送：一条持久流承载所有帧同步/状态广播。
+    async fn push_stream(
+        &self,
+        request: Request<tonic::Streaming<PushRequest>>,
+    ) -> Result<Response<Self::PushStreamStream>, Status> {
+        let mut rx = request.into_inner();
+        let (tx, out_rx) = tokio::sync::mpsc::channel::<Result<PushReply, Status>>(256);
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.message().await {
+                    Ok(Some(req)) => {
+                        let ok = route_push(&ctx, req).await;
+                        if tx.send(Ok(PushReply { ok })).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(out_rx))))
     }
 
     async fn kick(&self, request: Request<KickRequest>) -> Result<Response<KickReply>, Status> {
@@ -91,6 +110,21 @@ impl GatewayService for GatewayGrpc {
             None => false,
         };
         Ok(Response::new(KickReply { ok }))
+    }
+}
+
+/// 路由一条推送：KCP 会话 → 裸 UDP → TCP 回退。
+async fn route_push(ctx: &Ctx, req: PushRequest) -> bool {
+    // 先把 Arc 克隆出 Ref 再 await，避免 Ref 跨 await 持有分片读锁
+    match ctx.sessions.get(&req.conn_id).map(|r| r.clone()) {
+        Some(s) => {
+            debug!("push conn {} msg 0x{:X} udp={}", req.conn_id, req.msg_id, req.udp);
+            s.push_msg(ctx, req.msg_id, req.payload.into(), req.udp).await
+        }
+        None => {
+            debug!("push conn {} not found", req.conn_id);
+            false
+        }
     }
 }
 

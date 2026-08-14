@@ -17,6 +17,9 @@ package grimoire;
 service GatewayService {
   // 业务服务 -> 网关：主动推送/下发到某连接
   rpc Push(PushRequest) returns (PushReply);
+  // 业务服务 -> 网关：双向流式推送（高性能路径）。
+  // 一条持久流承载所有帧同步/状态广播，避免每帧一次 unary RPC 的 h2 流开销。
+  rpc PushStream(stream PushRequest) returns (stream PushReply);
   // 业务服务 -> 网关：踢掉某连接
   rpc Kick(KickRequest) returns (KickReply);
 }
