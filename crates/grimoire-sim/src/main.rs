@@ -41,6 +41,9 @@ struct Args {
     duration: u64,
     #[arg(long, default_value = "0")]
     rps: u64,
+    /// 每连接并发的在途请求数（管线）；>1 测吞吐天花板
+    #[arg(long, default_value = "1")]
+    pipeline: u32,
 }
 
 #[tokio::main]
@@ -465,41 +468,46 @@ async fn room_migrate_demo(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// 压测：N 连接并发发 RoomList，统计 QPS 与延迟分位。
+/// 压测：N 连接 × 每连接 pipeline 个在途请求并发发 RoomList。
+/// pipeline=1 时 QPS ≈ 连接数/RTT（测延迟）；pipeline>1 时绕开 RTT 限制，
+/// 直接压出服务器真实吞吐上限。
 async fn bench(args: &Args) -> Result<()> {
+    let pipeline = args.pipeline.max(1);
     info!(
-        "=== bench {} clients x {}s on {} (msg=RoomList) ===",
-        args.clients, args.duration, args.gateway
+        "=== bench {} clients x {}s, pipeline={} on {} (msg=RoomList) ===",
+        args.clients, args.duration, pipeline, args.gateway
     );
-    let (tx, mut rx) = mpsc::channel::<(u64, Duration)>(args.clients * 100);
+    let (tx, mut rx) = mpsc::channel::<(u64, Duration)>(args.clients * pipeline as usize * 100);
 
     for i in 0..args.clients {
-        let tx = tx.clone();
         let gw = args.gateway.clone();
-        let rps = args.rps;
-        tokio::spawn(async move {
-            let Ok(c) = Client::connect(&gw, i as u32).await else { return };
-            let mut interval = if rps > 0 {
-                Some(tokio::time::interval(Duration::from_micros(1_000_000 / rps.max(1))))
+        let Ok(c) = Client::connect(&gw, i as u32).await else { continue };
+        for _ in 0..pipeline {
+            let tx = tx.clone();
+            let c = c.clone();
+            // 限速仅用于 pipeline=1 的向后兼容场景
+            let interval = if pipeline == 1 && args.rps > 0 {
+                Some(tokio::time::interval(Duration::from_micros(1_000_000 / args.rps.max(1))))
             } else {
                 None
             };
-            let mut n = 0u64;
-            loop {
-                if let Some(iv) = &mut interval {
-                    iv.tick().await;
-                }
-                let start = Instant::now();
-                let r = c.request(msg::ROOM_LIST, vec![]).await;
-                let lat = start.elapsed();
-                if r.is_ok() {
-                    n += 1;
-                    if tx.send((n, lat)).await.is_err() {
-                        return;
+            tokio::spawn(async move {
+                let mut interval = interval;
+                loop {
+                    if let Some(iv) = &mut interval {
+                        iv.tick().await;
+                    }
+                    let start = Instant::now();
+                    let r = c.request(msg::ROOM_LIST, vec![]).await;
+                    let lat = start.elapsed();
+                    if r.is_ok() {
+                        if tx.send((1, lat)).await.is_err() {
+                            return;
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
     }
     drop(tx);
 

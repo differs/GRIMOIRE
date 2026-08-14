@@ -17,7 +17,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 pub struct Client {
     tx: mpsc::Sender<Frame>,
     responses: Arc<DashMap<u32, oneshot::Sender<Frame>>>,
-    seq: AtomicU32,
+    seq: Arc<AtomicU32>,
     pub pushes: broadcast::Receiver<Frame>,
     conn_id_label: u32,
     /// 网关欢迎帧下发的全局连接号
@@ -78,7 +78,7 @@ impl Client {
         Ok(Self {
             tx,
             responses,
-            seq: AtomicU32::new(1),
+            seq: Arc::new(AtomicU32::new(1)),
             pushes,
             conn_id_label,
             conn_id,
@@ -159,7 +159,7 @@ impl Clone for Client {
         Self {
             tx: self.tx.clone(),
             responses: self.responses.clone(),
-            seq: AtomicU32::new(self.seq.load(Ordering::Relaxed)),
+            seq: self.seq.clone(),
             pushes: self.pushes.resubscribe(),
             conn_id_label: self.conn_id_label,
             conn_id: self.conn_id.clone(),
