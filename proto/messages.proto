@@ -169,8 +169,17 @@ message BattleJoinResp {
 message BattleInputReq {
   float dir_x = 1;         // 移动方向向量
   float dir_y = 2;
+  uint64 frame = 3;        // 输入针对的帧号（客户端本地帧计数器，用于服务端延迟补偿）
 }
 message BattleInputResp {}
+
+// 快照回放：客户端断帧后请求从 last_frame 之后的权威快照
+message BattleResyncReq {
+  uint64 last_frame = 1;   // 客户端已收到的最后帧
+}
+message BattleResyncResp {
+  repeated FrameSyncPush frames = 1;  // last_frame+1 起（若太旧则回退最近 N 帧）
+}
 
 message BattleLeaveReq {}
 message BattleLeaveResp {}

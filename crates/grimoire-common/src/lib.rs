@@ -20,6 +20,9 @@ pub mod msg {
     /// payload = [玩法域 1B][session_id 4B 大端]；之后该连接在对应玩法域的请求
     /// 按会话查 Redis 目录路由到托管节点。
     pub const SYS_BIND_SESSION: u32 = 0x0000_FFFD;
+    /// 系统消息：客户端->网关 鉴权握手。
+    /// payload = token 字节串；网关校验通过后该连接才允许业务请求。
+    pub const SYS_AUTH: u32 = 0x0000_FFFC;
 
     pub fn domain_of(msg_id: u32) -> u32 {
         msg_id & DOMAIN_MASK
@@ -40,6 +43,7 @@ pub mod msg {
     pub const BATTLE_JOIN: u32 = DOMAIN_BATTLE | 0x0001;
     pub const BATTLE_INPUT: u32 = DOMAIN_BATTLE | 0x0002;
     pub const BATTLE_LEAVE: u32 = DOMAIN_BATTLE | 0x0003;
+    pub const BATTLE_RESYNC: u32 = DOMAIN_BATTLE | 0x0004;
     pub const BATTLE_FRAME_SYNC: u32 = DOMAIN_BATTLE | 0x0100;
 
     /// ---- card 玩法 ----

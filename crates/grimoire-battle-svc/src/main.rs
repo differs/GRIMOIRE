@@ -16,7 +16,8 @@ use dashmap::DashMap;
 use grimoire_common::{msg, svc};
 use grimoire_pb::pb::{
     service_bridge_server::{ServiceBridge, ServiceBridgeServer},
-    BattleInputReq, BattleInputResp, BattleJoinReq, BattleJoinResp, BattleLeaveResp,
+    BattleInputReq, BattleInputResp, BattleJoinReq, BattleJoinResp, BattleLeaveResp, BattleResyncReq,
+    BattleResyncResp,
     BattlePlayer, ForwardReply, ForwardRequest, FrameSyncPush, PlayerEvent,
 };
 use grimoire_svcfw::Pusher;
@@ -55,17 +56,31 @@ impl Player {
     }
 }
 
+/// 输入延迟补偿帧数：服务端把输入延后 INPUT_DELAY_FRAMES 帧应用，
+/// 吸收网络抖动，让同一帧内所有玩家的输入公平生效
+const INPUT_DELAY_FRAMES: u64 = 2;
+/// 权威快照环形缓冲大小（快照回放用）
+const SNAPSHOT_RING: usize = 30;
+
 struct Battle {
     id: u32,
     frame: u64,
     players: HashMap<u32, Player>,
-    /// 每名玩家最新输入 (dir_x, dir_y)
-    inputs: HashMap<u32, (f32, f32)>,
+    /// 帧号 -> 该帧待应用的输入 (player_id, dir_x, dir_y)
+    pending: HashMap<u64, Vec<(u32, f32, f32)>>,
+    /// 权威快照环形缓冲：(frame, 该帧玩家状态)
+    ring: std::collections::VecDeque<(u64, Vec<BattlePlayer>)>,
 }
 
 impl Battle {
     fn new(id: u32) -> Self {
-        Self { id, frame: 0, players: HashMap::new(), inputs: HashMap::new() }
+        Self {
+            id,
+            frame: 0,
+            players: HashMap::new(),
+            pending: HashMap::new(),
+            ring: std::collections::VecDeque::new(),
+        }
     }
 
     fn add_player(&mut self, p: Player) {
@@ -81,24 +96,57 @@ impl Battle {
 
     fn remove_player(&mut self, player_id: u32) {
         self.players.remove(&player_id);
-        self.inputs.remove(&player_id);
+        for v in self.pending.values_mut() {
+            v.retain(|(pid, _, _)| *pid != player_id);
+        }
     }
 
-    /// 确定性模拟：按各玩家最近输入推进一帧。
+    fn is_full(&self) -> bool {
+        self.players.len() >= BATTLE_CAPACITY
+    }
+
+    /// 延迟补偿：把输入排入目标帧的槽位。
+    /// 目标帧 = 输入帧 + INPUT_DELAY_FRAMES；已过期则排入下一帧（latest-wins）。
+    fn input(&mut self, player_id: u32, dx: f32, dy: f32, frame: u64) {
+        let target = frame.saturating_add(INPUT_DELAY_FRAMES).max(self.frame + 1);
+        self.pending.entry(target).or_default().push((player_id, dx, dy));
+    }
+
+    /// 确定性模拟：应用本帧排队的输入，推进一帧，记录权威快照。
     fn tick_frame(&mut self) {
         let dt = 1.0 / FRAME_RATE as f32;
-        for (pid, (dx, dy)) in self.inputs.iter() {
-            if let Some(p) = self.players.get_mut(pid) {
-                let norm = (dx * dx + dy * dy).sqrt();
-                if norm > 1e-6 {
-                    p.x += (dx / norm) * SPEED * dt;
-                    p.y += (dy / norm) * SPEED * dt;
-                    p.x = p.x.clamp(0.0, FIELD);
-                    p.y = p.y.clamp(0.0, FIELD);
+        if let Some(inputs) = self.pending.remove(&self.frame) {
+            for (pid, dx, dy) in inputs {
+                if let Some(p) = self.players.get_mut(&pid) {
+                    let norm = (dx * dx + dy * dy).sqrt();
+                    if norm > 1e-6 {
+                        p.x += (dx / norm) * SPEED * dt;
+                        p.y += (dy / norm) * SPEED * dt;
+                        p.x = p.x.clamp(0.0, FIELD);
+                        p.y = p.y.clamp(0.0, FIELD);
+                    }
                 }
             }
         }
         self.frame += 1;
+        let snap: Vec<BattlePlayer> = self.players.values().map(|p| p.proto()).collect();
+        self.ring.push_back((self.frame, snap));
+        if self.ring.len() > SNAPSHOT_RING {
+            self.ring.pop_front();
+        }
+    }
+
+    /// 快照回放：返回 last_frame 之后（若太旧则回退最近 N 帧）的权威快照。
+    fn resync(&self, last_frame: u64) -> Vec<FrameSyncPush> {
+        self.ring
+            .iter()
+            .filter(|(f, _)| *f > last_frame)
+            .map(|(f, players)| FrameSyncPush {
+                frame: *f,
+                battle_id: self.id,
+                players: players.clone(),
+            })
+            .collect()
     }
 
     /// 生成要广播的帧快照（编码一次，发给所有成员）。
@@ -154,6 +202,7 @@ impl App {
                 break;
             }
         }
+        let created_new = target_id.is_none();
         let target_id = match target_id {
             Some(id) => id,
             None => {
@@ -167,12 +216,20 @@ impl App {
         let b = self.battles.get(&target_id).unwrap();
         let mut battle = b.value().lock().await;
         battle.add_player(Player { player_id, x: 0.0, y: 0.0, conn_id });
+        let full = battle.is_full();
         let resp = self.join_resp(target_id, player_id, &battle);
         drop(battle);
         self.conn_battle.insert(conn_id, (target_id, player_id));
-        // 会话目录：登记本节点托管该战斗
+        // 会话目录 + 撮合大厅
         if let Some(sd) = &self.session_dir {
             let _ = sd.bind(msg::DOMAIN_BATTLE, target_id, &self.node_id).await;
+            if created_new {
+                // 新局 1 人等待匹配 → 登记大厅；满局时清掉
+                let _ = sd.lobby_set(msg::DOMAIN_BATTLE, target_id).await;
+            }
+            if full {
+                sd.lobby_clear(msg::DOMAIN_BATTLE, target_id).await;
+            }
         }
         info!("battle {} joined by player {}", target_id, player_id);
         resp
@@ -187,15 +244,23 @@ impl App {
         }
     }
 
-    async fn input(&self, conn_id: u32, dx: f32, dy: f32) -> bool {
+    async fn input(&self, conn_id: u32, dx: f32, dy: f32, frame: u64) -> bool {
         if let Some((bid, pid)) = self.conn_battle.get(&conn_id).map(|v| *v) {
             if let Some(b) = self.battles.get(&bid) {
                 let mut battle = b.value().lock().await;
-                battle.inputs.insert(pid, (dx, dy));
+                battle.input(pid, dx, dy, frame);
                 return true;
             }
         }
         false
+    }
+
+    /// 快照回放：返回客户端缺失帧的权威快照。
+    async fn resync(&self, conn_id: u32, last_frame: u64) -> Option<Vec<FrameSyncPush>> {
+        let (bid, _pid) = *self.conn_battle.get(&conn_id)?;
+        let b = self.battles.get(&bid)?;
+        let battle = b.value().lock().await;
+        Some(battle.resync(last_frame))
     }
 
     async fn leave(&self, conn_id: u32) -> bool {
@@ -206,11 +271,17 @@ impl App {
             let mut battle = b.value().lock().await;
             battle.remove_player(pid);
             let empty = battle.players.is_empty();
+            let single = battle.players.len() == 1;
             // 先释放 Ref（读锁）再 remove（写锁），否则 DashMap 分片自死锁
             drop(battle);
             drop(b);
             if empty {
                 self.battles.remove(&bid);
+            } else if single {
+                // 满局退成 1 人 → 重新登记大厅等待匹配
+                if let Some(sd) = &self.session_dir {
+                    let _ = sd.lobby_set(msg::DOMAIN_BATTLE, bid).await;
+                }
             }
         }
         true
@@ -267,8 +338,17 @@ async fn process(app: &Arc<App>, req: ForwardRequest) -> ForwardReply {
         },
         msg::BATTLE_INPUT => match dec::<BattleInputReq>(&req.payload) {
             Ok(m) => {
-                app.input(req.conn_id, m.dir_x, m.dir_y).await;
+                app.input(req.conn_id, m.dir_x, m.dir_y, m.frame).await;
                 reply(encode(&BattleInputResp {}))
+            }
+            Err(e) => err(format!("bad payload: {e}")),
+        },
+        msg::BATTLE_RESYNC => match dec::<BattleResyncReq>(&req.payload) {
+            Ok(m) => {
+                match app.resync(req.conn_id, m.last_frame).await {
+                    Some(frames) => reply(encode(&BattleResyncResp { frames })),
+                    None => err("未在对局中".into()),
+                }
             }
             Err(e) => err(format!("bad payload: {e}")),
         },

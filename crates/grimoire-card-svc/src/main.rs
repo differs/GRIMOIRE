@@ -235,9 +235,15 @@ impl App {
             (idx, state, started)
         };
 
-        // 会话目录：登记本节点托管该对局
+        // 会话目录 + 撮合大厅
         if let Some(sd) = &self.session_dir {
             let _ = sd.bind(msg::DOMAIN_CARD, game_id, &self.node_id).await;
+            if !started {
+                // 1 人等待匹配 → 登记大厅
+                let _ = sd.lobby_set(msg::DOMAIN_CARD, game_id).await;
+            } else {
+                sd.lobby_clear(msg::DOMAIN_CARD, game_id).await;
+            }
         }
         // 第二人加入后，给先手玩家也推送开局状态
         if started {

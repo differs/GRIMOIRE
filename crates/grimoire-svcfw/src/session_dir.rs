@@ -56,4 +56,52 @@ impl SessionDir {
             }
         }
     }
+
+    fn lobby_key(domain: u32) -> String {
+        format!("{}lobby:{}", KEY_PREFIX, domain)
+    }
+
+    /// 撮合大厅：登记一个等待匹配的会话（SETNX，已有等待局则不覆盖）。
+    pub async fn lobby_set(&self, domain: u32, session_id: u32) -> bool {
+        let r: Result<bool, redis::RedisError> = redis::cmd("SET")
+            .arg(Self::lobby_key(domain))
+            .arg(session_id)
+            .arg("NX")
+            .query_async(&mut self.redis.clone())
+            .await;
+        r.unwrap_or(false)
+    }
+
+    /// 撮合大厅：原子取走一个等待会话（GETDEL），返回 None 表示无等待局。
+    pub async fn lobby_take(&self, domain: u32) -> Option<u32> {
+        let r: Result<Option<u32>, redis::RedisError> = redis::cmd("GETDEL")
+            .arg(Self::lobby_key(domain))
+            .query_async(&mut self.redis.clone())
+            .await;
+        match r {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("lobby take {} failed: {}", domain, e);
+                None
+            }
+        }
+    }
+
+    /// 撮合大厅：仅当值匹配时清除（避免清掉新登记的等待局）。
+    pub async fn lobby_clear(&self, domain: u32, session_id: u32) {
+        let script = r#"
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            end
+            return 0
+        "#;
+        let r: Result<i64, redis::RedisError> = redis::Script::new(script)
+            .key(Self::lobby_key(domain))
+            .arg(session_id)
+            .invoke_async(&mut self.redis.clone())
+            .await;
+        if let Err(e) = r {
+            warn!("lobby clear {}:{} failed: {}", domain, session_id, e);
+        }
+    }
 }

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -12,7 +12,6 @@ use futures::StreamExt;
 use grimoire_common::{conn, msg};
 use grimoire_net::{udp, Frame, FrameCodec, PType};
 use grimoire_pb::pb::{service_bridge_client::ServiceBridgeClient, ForwardRequest, PlayerEvent};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, info, warn};
@@ -47,6 +46,8 @@ pub struct Ctx {
     pub conn_session: Arc<DashMap<u32, (u32, u32)>>,
     /// (玩法域, session_id) -> (节点ID, 过期纳秒) 本地缓存
     pub session_cache: Arc<DashMap<(u32, u32), (String, u64)>>,
+    /// 鉴权密钥（空 = 关闭鉴权）
+    pub auth_secret: String,
 }
 
 pub struct Session {
@@ -56,6 +57,8 @@ pub struct Session {
     active_domains: AtomicU32,
     /// 客户端 UDP 源地址（首次收到其 UDP 包时绑定）
     udp_addr: Mutex<Option<SocketAddr>>,
+    /// 已鉴权
+    authed: AtomicBool,
 }
 
 impl Session {
@@ -65,7 +68,16 @@ impl Session {
             tx,
             active_domains: AtomicU32::new(0),
             udp_addr: Mutex::new(None),
+            authed: AtomicBool::new(false),
         })
+    }
+
+    pub fn set_authed(&self, v: bool) {
+        self.authed.store(v, Ordering::Relaxed);
+    }
+
+    pub fn authed(&self) -> bool {
+        self.authed.load(Ordering::Relaxed)
     }
 
     pub fn conn_id(&self) -> u32 {
@@ -136,12 +148,17 @@ impl Session {
     }
 }
 
-pub async fn accept_and_serve(ctx: Arc<Ctx>, stream: TcpStream, peer: SocketAddr) {
-    // 游戏服务器标配：禁用 Nagle，避免小包延迟叠加
-    let _ = stream.set_nodelay(true);
+pub async fn accept_and_serve<R, W>(
+    ctx: Arc<Ctx>,
+    read_half: R,
+    write_half: W,
+    peer: SocketAddr,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let local = ctx.next_conn_id.fetch_add(1, Ordering::Relaxed);
     let conn_id = conn::make(ctx.gateway_id, local);
-    let (read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::channel::<Frame>(128);
 
     let session = Session::new(conn_id, tx);
@@ -188,7 +205,22 @@ pub async fn accept_and_serve(ctx: Arc<Ctx>, stream: TcpStream, peer: SocketAddr
             PType::Request if frame.msg_id == msg::SYS_BIND_SESSION => {
                 handle_bind_session(&ctx, &session, frame).await;
             }
+            PType::Request if frame.msg_id == msg::SYS_AUTH => {
+                handle_auth(&ctx, &session, frame).await;
+            }
             PType::Request => {
+                // 鉴权开关：未鉴权的业务请求直接拒绝
+                if !ctx.auth_secret.is_empty() && !session.authed() {
+                    let _ = session
+                        .send(Frame {
+                            ptype: PType::Response,
+                            msg_id: 0,
+                            seq: frame.seq,
+                            payload: Bytes::from_static(b"err:unauthorized"),
+                        })
+                        .await;
+                    continue;
+                }
                 let s = session.clone();
                 let c = ctx.clone();
                 tokio::spawn(forward_request(c, s, frame));
@@ -301,6 +333,27 @@ async fn handle_bind_session(ctx: &Ctx, session: &Arc<Session>, frame: Frame) {
         .await;
 }
 
+/// 跨节点撮合：战斗/牌局的匹配请求若无会话绑定，从 Redis 大厅取等待局并绑定。
+async fn try_matchmake(ctx: &Ctx, domain: u32, msg_id: u32, conn_id: u32) {
+    let is_match = match domain {
+        d if d == msg::DOMAIN_BATTLE => msg_id == msg::BATTLE_JOIN,
+        d if d == msg::DOMAIN_CARD => msg_id == msg::CARD_START,
+        _ => false,
+    };
+    if !is_match {
+        return;
+    }
+    let Some(sd) = ctx.session_dir.as_ref() else { return };
+    // 已有会话绑定则跳过
+    if ctx.conn_session.get(&conn_id).map(|v| v.0 == domain).unwrap_or(false) {
+        return;
+    }
+    if let Some(sid) = sd.lobby_take(domain).await {
+        ctx.conn_session.insert(conn_id, (domain, sid));
+        debug!("matchmade conn {} -> session {}:{}", conn_id, domain, sid);
+    }
+}
+
 /// 会话目录路由：连接绑定了目标玩法域会话时，查目录返回托管节点。
 async fn session_target_node(ctx: &Ctx, domain: u32, session: &Arc<Session>) -> Option<Arc<grimoire_pb::pb::NodeInfo>> {
     let sd = ctx.session_dir.as_ref()?;
@@ -325,6 +378,24 @@ async fn session_target_node(ctx: &Ctx, domain: u32, session: &Arc<Session>) -> 
     ctx.discovery.resolve_by_node_id(domain, &node_id).await
 }
 
+/// 鉴权握手：校验 token，通过则标记会话已鉴权。
+async fn handle_auth(ctx: &Ctx, session: &Arc<Session>, frame: Frame) {
+    let ok = if ctx.auth_secret.is_empty() {
+        true // 未配置密钥 = 鉴权关闭
+    } else {
+        String::from_utf8_lossy(&frame.payload) == ctx.auth_secret.as_str()
+    };
+    session.set_authed(ok);
+    let _ = session
+        .send(Frame {
+            ptype: PType::Response,
+            msg_id: if ok { msg::SYS_AUTH } else { 0 },
+            seq: frame.seq,
+            payload: Bytes::new(),
+        })
+        .await;
+}
+
 /// 把客户端请求经流式复用转发到对应玩法服务，取回响应并回写。
 async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
     let domain = msg::domain_of(frame.msg_id);
@@ -332,6 +403,8 @@ async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
     let result: Result<(), String> = async {
         let svc_name = crate::discovery::service_for_domain(domain)
             .ok_or_else(|| format!("unknown domain 0x{:X}", domain))?;
+        // 跨节点撮合：战斗/牌局的匹配请求若无会话绑定，先从 Redis 大厅取等待局
+        try_matchmake(&ctx, domain, frame.msg_id, session.conn_id()).await;
         // 会话绑定优先：连接已绑定会话时按 Redis 目录路由到托管节点
         let node = match session_target_node(&ctx, domain, &session).await {
             Some(n) => n,

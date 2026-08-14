@@ -49,6 +49,15 @@ struct Args {
     /// Redis 地址（会话目录）
     #[arg(long, default_value = "redis://127.0.0.1:6379")]
     redis: String,
+    /// 鉴权密钥（空 = 关闭鉴权）
+    #[arg(long, default_value = "")]
+    auth_secret: String,
+    /// TLS 证书（PEM）；与 --tls-key 同时提供则启用 TLS
+    #[arg(long, default_value = "")]
+    tls_cert: String,
+    /// TLS 私钥（PEM）
+    #[arg(long, default_value = "")]
+    tls_key: String,
 }
 
 /// gRPC 侧：业务服务主动 push/kick 到客户端连接
@@ -167,7 +176,11 @@ async fn main() -> anyhow::Result<()> {
         session_dir,
         conn_session: Arc::new(DashMap::new()),
         session_cache: Arc::new(DashMap::new()),
+        auth_secret: args.auth_secret.clone(),
     });
+    if !args.auth_secret.is_empty() {
+        info!("auth enabled");
+    }
 
     // 注册到注册中心（多活网关按 id 区分）
     grimoire_svcfw::register_and_heartbeat(
@@ -180,17 +193,46 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    // TCP 客户端接入
+    // TCP 客户端接入（可选 TLS 包裹）
     let listener = tokio::net::TcpListener::bind(&args.client_listen).await?;
-    info!("gateway {} tcp listening on {}", args.id, args.client_listen);
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let tls_acceptor = if !args.tls_cert.is_empty() && !args.tls_key.is_empty() {
+        let certs: Vec<rustls::pki_types::CertificateDer> = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(&args.tls_cert)?))
+            .collect::<Result<_, _>>()?;
+        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(&args.tls_key)?))?
+            .ok_or_else(|| anyhow::anyhow!("no private key in {}", args.tls_key))?;
+        let cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?;
+        info!("gateway {} TLS enabled on {}", args.id, args.client_listen);
+        Some(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg)))
+    } else {
+        info!("gateway {} tcp listening on {}", args.id, args.client_listen);
+        None
+    };
 
     let ctx_tcp = ctx.clone();
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true);
                     let c = ctx_tcp.clone();
-                    tokio::spawn(session::accept_and_serve(c, stream, peer));
+                    if let Some(acceptor) = &tls_acceptor {
+                        let acceptor = acceptor.clone();
+                        tokio::spawn(async move {
+                            match acceptor.accept(stream).await {
+                                Ok(tls) => {
+                                    let (r, w) = tokio::io::split(tls);
+                                    session::accept_and_serve(c, r, w, peer).await;
+                                }
+                                Err(e) => warn!("tls accept from {} error: {}", peer, e),
+                            }
+                        });
+                    } else {
+                        let (r, w) = stream.into_split();
+                        tokio::spawn(session::accept_and_serve(c, r, w, peer));
+                    }
                 }
                 Err(e) => warn!("accept error: {}", e),
             }

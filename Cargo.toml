@@ -39,6 +39,9 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"
 clap = { version = "4", features = ["derive"] }
 etcd-client = "0.13"
+rustls = "0.23"
+tokio-rustls = { version = "0.26", features = ["ring"] }
+rustls-pemfile = "2"
 kcp = "0.3"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "tls-none", "derive"] }
 redis = { version = "0.27", features = ["tokio-comp"] }

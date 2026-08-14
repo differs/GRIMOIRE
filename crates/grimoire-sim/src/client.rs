@@ -26,9 +26,31 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(addr: &str, conn_id_label: u32) -> anyhow::Result<Self> {
+        Self::connect_with(addr, conn_id_label, false).await
+    }
+
+    /// tls=true 时用 rustls 建立 TLS 连接（dev：接受任意自签证书）。
+    pub async fn connect_with(addr: &str, conn_id_label: u32, tls: bool) -> anyhow::Result<Self> {
         let stream = TcpStream::connect(addr).await.context("connect gateway")?;
         let _ = stream.set_nodelay(true);
-        let (read_half, write_half) = stream.into_split();
+        let (read_half, write_half): (
+            Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+            Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        ) = if tls {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(NoVerifier))
+                .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+            let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let tls = connector.connect(name, stream).await.context("tls connect")?;
+            let (r, w) = tokio::io::split(tls);
+            (Box::new(r), Box::new(w))
+        } else {
+            let (r, w) = stream.into_split();
+            (Box::new(r), Box::new(w))
+        };
 
         let (tx, mut tx_rx) = mpsc::channel::<Frame>(128);
         tokio::spawn(async move {
@@ -131,6 +153,16 @@ impl Client {
         }
     }
 
+    /// 鉴权握手：提交 token（空 = 关闭鉴权时也返回 ok）。
+    pub async fn auth(&self, token: &str) -> anyhow::Result<()> {
+        let r = self.request(msg::SYS_AUTH, token.as_bytes().to_vec()).await?;
+        if r.msg_id == msg::SYS_AUTH {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("auth failed"))
+        }
+    }
+
     /// 发送请求并等待对应响应（5s 超时）。
     pub async fn request(&self, msg_id: u32, payload: Vec<u8>) -> anyhow::Result<Frame> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
@@ -196,8 +228,8 @@ impl UdpBattle {
         Ok(Self { sock, conn_id })
     }
 
-    pub async fn send_input(&self, dir_x: f32, dir_y: f32) -> anyhow::Result<()> {
-        let payload = grimoire_pb::pb::encode_message(&grimoire_pb::pb::BattleInputReq { dir_x, dir_y });
+    pub async fn send_input(&self, dir_x: f32, dir_y: f32, frame: u64) -> anyhow::Result<()> {
+        let payload = grimoire_pb::pb::encode_message(&grimoire_pb::pb::BattleInputReq { dir_x, dir_y, frame });
         let pkt = udp::peer_packet(self.conn_id, msg::BATTLE_INPUT, &payload);
         self.sock.send(&pkt).await?;
         Ok(())
@@ -309,8 +341,8 @@ impl UdpKcp {
         Ok(Self { kcp, conn_id, frames: Arc::new(tokio::sync::Mutex::new(frames_rx)) })
     }
 
-    pub async fn send_input(&self, dir_x: f32, dir_y: f32) -> anyhow::Result<()> {
-        let payload = grimoire_pb::pb::encode_message(&grimoire_pb::pb::BattleInputReq { dir_x, dir_y });
+    pub async fn send_input(&self, dir_x: f32, dir_y: f32, frame: u64) -> anyhow::Result<()> {
+        let payload = grimoire_pb::pb::encode_message(&grimoire_pb::pb::BattleInputReq { dir_x, dir_y, frame });
         let pkt = udp::peer_packet(self.conn_id, msg::BATTLE_INPUT, &payload);
         self.kcp.lock().unwrap().send(&pkt)?;
         Ok(())
@@ -334,4 +366,48 @@ pub fn enc<T: prost::Message>(m: &T) -> Vec<u8> {
 /// 解码 protobuf 消息
 pub fn dec<T: prost::Message + Default>(payload: &[u8]) -> anyhow::Result<T> {
     Ok(grimoire_pb::pb::decode_message(payload)?)
+}
+
+/// dev 用：接受任意服务端证书（不校验链/域名）。
+#[derive(Debug)]
+struct NoVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+        ]
+    }
 }

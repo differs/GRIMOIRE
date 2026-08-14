@@ -10,6 +10,7 @@
 
 mod client;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -52,6 +53,21 @@ struct Args {
     /// KCP 快重传次数（battle-stress 用）
     #[arg(long, default_value = "2")]
     kcp_resend: i32,
+    /// 用 TLS 连接网关（dev 接受自签证书）
+    #[arg(long, default_value = "false")]
+    tls: bool,
+    /// 鉴权 token（空 = 不鉴权）
+    #[arg(long, default_value = "")]
+    auth_token: String,
+}
+
+/// 连接网关（可选 TLS + 鉴权）
+async fn connect(args: &Args, gw: &str, label: u32) -> Result<Client> {
+    let c = Client::connect_with(gw, label, args.tls).await?;
+    if !args.auth_token.is_empty() {
+        c.auth(&args.auth_token).await?;
+    }
+    Ok(c)
 }
 
 #[tokio::main]
@@ -133,9 +149,9 @@ fn fmt_card_state(s: Option<&CardGameState>) -> String {
 
 async fn room_demo(args: &Args) -> Result<()> {
     info!("=== room demo ===");
-    let a = Client::connect(&args.gateway, 1).await?;
+    let a = connect(args, &args.gateway, 1).await?;
     a.start_heartbeat();
-    let b = Client::connect(&args.gateway_b, 2).await?;
+    let b = connect(args, &args.gateway_b, 2).await?;
     b.start_heartbeat();
     // 提前订阅 push，与交互流程并行打印
     let (pa, pb) = (a.clone(), b.clone());
@@ -175,31 +191,32 @@ async fn room_demo(args: &Args) -> Result<()> {
 
 async fn battle_demo(args: &Args) -> Result<()> {
     info!("=== battle demo ===");
-    let a = Client::connect(&args.gateway, 1).await?;
+    let a = connect(args, &args.gateway, 1).await?;
     a.start_heartbeat();
-    let b = Client::connect(&args.gateway_b, 2).await?;
+    let b = connect(args, &args.gateway_b, 2).await?;
     b.start_heartbeat();
 
     let r = a.request(msg::BATTLE_JOIN, vec![]).await?;
     let ja = dec::<BattleJoinResp>(&r.payload)?;
     info!("A joined battle#{} as player {} ({}Hz)", ja.battle_id, ja.player_id, ja.frame_rate);
     a.bind_session(msg::DOMAIN_BATTLE, ja.battle_id).await?;
-    // B 加入前绑定到同一战斗 → 按会话路由到 A 所在节点（跨实例撮合）
-    b.bind_session(msg::DOMAIN_BATTLE, ja.battle_id).await?;
+    // B 不做显式绑定 → 网关从 Redis 撮合大厅自动匹配到 A 的战斗（跨节点撮合）
     let r = b.request(msg::BATTLE_JOIN, vec![]).await?;
     let jb = dec::<BattleJoinResp>(&r.payload)?;
     info!("B joined battle#{} as player {}", jb.battle_id, jb.player_id);
 
-    // A 持续移动
+    // A 持续移动（带客户端帧号，用于服务端延迟补偿）
     let a2 = a.clone();
     let push_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         let mut t = 0.0_f32;
+        let mut f = 0u64;
         loop {
             tick.tick().await;
             t += 0.5;
+            f += 1;
             let (dx, dy) = (t.cos(), t.sin());
-            let _ = a2.request(msg::BATTLE_INPUT, enc(&BattleInputReq { dir_x: dx, dir_y: dy })).await;
+            let _ = a2.request(msg::BATTLE_INPUT, enc(&BattleInputReq { dir_x: dx, dir_y: dy, frame: f })).await;
         }
     });
 
@@ -212,9 +229,9 @@ async fn battle_demo(args: &Args) -> Result<()> {
 /// 实时对战 UDP 通道：TCP 入局拿身份，UDP 发输入 + 收帧同步。
 async fn battle_udp_demo(args: &Args) -> Result<()> {
     info!("=== battle-udp demo ===");
-    let a = Client::connect(&args.gateway, 1).await?;
+    let a = connect(args, &args.gateway, 1).await?;
     a.start_heartbeat();
-    let b = Client::connect(&args.gateway_b, 2).await?;
+    let b = connect(args, &args.gateway_b, 2).await?;
     b.start_heartbeat();
     let (pa, pb) = (a.clone(), b.clone());
     let printer = tokio::spawn(async move {
@@ -245,10 +262,12 @@ async fn battle_udp_demo(args: &Args) -> Result<()> {
     let ua2 = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(50));
         let mut t = 0.0_f32;
+        let mut f = 0u64;
         loop {
             tick.tick().await;
             t += 0.3;
-            let _ = ua_send.send_input(t.cos(), t.sin()).await;
+            f += 1;
+            let _ = ua_send.send_input(t.cos(), t.sin(), f).await;
         }
     });
 
@@ -285,9 +304,9 @@ async fn battle_udp_demo(args: &Args) -> Result<()> {
 /// 实时对战 KCP 通道：与 battle-udp 相同流程，但走 KCP 可靠 UDP。
 async fn battle_kcp_demo(args: &Args) -> Result<()> {
     info!("=== battle-kcp demo ===");
-    let a = Client::connect(&args.gateway, 1).await?;
+    let a = connect(args, &args.gateway, 1).await?;
     a.start_heartbeat();
-    let b = Client::connect(&args.gateway_b, 2).await?;
+    let b = connect(args, &args.gateway_b, 2).await?;
     b.start_heartbeat();
 
     let r = a.request(msg::BATTLE_JOIN, vec![]).await?;
@@ -306,30 +325,64 @@ async fn battle_kcp_demo(args: &Args) -> Result<()> {
     let ub = UdpKcp::bind(&args.udp_gateway_b, b_cid).await?;
     info!("KCP 会话绑定完成 (conn {} / {})", a_cid, b_cid);
 
-    // A 持续发输入
+    // A 持续发输入（客户端本地预测同步推进；服务端延迟 2 帧补偿）
+    let a_pid = ja.player_id;
+    let predicted = Arc::new(tokio::sync::Mutex::new((25.0f32, 50.0f32)));
     let ua_send_c = ua.clone();
-    let ua_send = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(50));
-        let mut t = 0.0_f32;
-        loop {
-            tick.tick().await;
-            t += 0.3;
-            let _ = ua_send_c.send_input(t.cos(), t.sin()).await;
+    let ua_send = tokio::spawn({
+        let pred = predicted.clone();
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            let mut t = 0.0_f32;
+            let mut f = 0u64;
+            loop {
+                tick.tick().await;
+                t += 0.3;
+                f += 1;
+                let (dx, dy) = (t.cos(), t.sin());
+                let _ = ua_send_c.send_input(dx, dy, f).await;
+                // 本地预测：与服务端相同的确定性移动
+                let norm = (dx * dx + dy * dy).sqrt();
+                let mut p = pred.lock().await;
+                if norm > 1e-6 {
+                    p.0 += (dx / norm) * 8.0 * 0.05;
+                    p.1 += (dy / norm) * 8.0 * 0.05;
+                }
+            }
         }
     });
 
-    // 两端收 KCP 帧同步
+    // 两端收 KCP 帧同步，展示预测 vs 权威（延迟补偿）
     let deadline = tokio::time::sleep(Duration::from_secs(4));
     tokio::pin!(deadline);
     let mut fa = 0u64;
     let mut fb = 0u64;
+    let mut resynced = false;
     loop {
         tokio::select! {
             _ = &mut deadline => break,
             r = ua.recv_push() => {
                 if let Ok(Some((_, _, payload))) = r {
                     if let Ok(p) = dec::<FrameSyncPush>(&payload) {
-                        if p.frame != fa { fa = p.frame; info!("[KCP A] frame#{}: {}", p.frame, fmt_battle(&p.players)); }
+                        if p.frame != fa {
+                            fa = p.frame;
+                            let pred = predicted.lock().await;
+                            let auth = p.players.iter().find(|x| x.player_id == a_pid).cloned();
+                            match auth {
+                                Some(ap) => info!("[KCP A] frame#{} pred=({:.0},{:.0}) auth=({:.0},{:.0})", p.frame, pred.0, pred.1, ap.x, ap.y),
+                                None => info!("[KCP A] frame#{}: {}", p.frame, fmt_battle(&p.players)),
+                            }
+                        }
+                        // 快照回放：模拟断帧（每 15 帧请求一次重同步）
+                        if !resynced && p.frame >= 15 {
+                            resynced = true;
+                            let last = p.frame.saturating_sub(3);
+                            if let Ok(r) = a.request(msg::BATTLE_RESYNC, enc(&BattleResyncReq { last_frame: last })).await {
+                                if let Ok(rs) = dec::<BattleResyncResp>(&r.payload) {
+                                    info!("[KCP A] 快照回放: 请求从帧{} 之后, 收到 {} 帧权威快照", last, rs.frames.len());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -362,7 +415,7 @@ async fn battle_stress_demo(args: &Args) -> Result<()> {
         let mut v = Vec::new();
         for i in 0..n {
             let gw = if i % 2 == 0 { args.gateway.clone() } else { args.gateway_b.clone() };
-            match Client::connect(&gw, i as u32).await {
+            match connect(args, &gw, i as u32).await {
                 Ok(c) => v.push(c),
                 Err(e) => {
                     info!("client {} connect fail: {}", i, e);
@@ -415,10 +468,12 @@ async fn battle_stress_demo(args: &Args) -> Result<()> {
                 async move {
                     let mut tick = tokio::time::interval(Duration::from_millis(50));
                     let mut t = 0.0_f32;
+                    let mut f = 0u64;
                     loop {
                         tick.tick().await;
                         t += 0.3;
-                        let _ = k.send_input(t.cos(), t.sin()).await;
+                        f += 1;
+                        let _ = k.send_input(t.cos(), t.sin(), f).await;
                     }
                 }
             });
@@ -473,9 +528,9 @@ async fn battle_stress_demo(args: &Args) -> Result<()> {
 
 async fn card_demo(args: &Args) -> Result<()> {
     info!("=== card demo ===");
-    let a = Client::connect(&args.gateway, 1).await?;
+    let a = connect(args, &args.gateway, 1).await?;
     a.start_heartbeat();
-    let b = Client::connect(&args.gateway_b, 2).await?;
+    let b = connect(args, &args.gateway_b, 2).await?;
     b.start_heartbeat();
     let (pa, pb) = (a.clone(), b.clone());
     let printer = tokio::spawn(async move {
@@ -559,7 +614,7 @@ fn fmt_hand(s: Option<&CardGameState>) -> String {
 /// 连接迁移 demo：A 建房入局 → 掉线 → 重连并恢复同一会话。
 async fn room_migrate_demo(args: &Args) -> Result<()> {
     info!("=== room-migrate demo ===");
-    let a = Client::connect(&args.gateway, 1).await?;
+    let a = connect(args, &args.gateway, 1).await?;
     let a_cid = a.wait_conn_id().await;
     info!("A connected, conn_id={}", a_cid);
 
@@ -571,7 +626,7 @@ async fn room_migrate_demo(args: &Args) -> Result<()> {
     info!("A created room #{}", room.room_id);
     a.bind_session(msg::DOMAIN_ROOM, room.room_id).await?;
 
-    let b = Client::connect(&args.gateway_b, 2).await?;
+    let b = connect(args, &args.gateway_b, 2).await?;
     // B 先绑定再登录，保证玩家与房间同节点
     b.bind_session(msg::DOMAIN_ROOM, room.room_id).await?;
     let r = b.request(msg::ROOM_LOGIN, enc(&RoomLoginReq { name: "小红".into() })).await?;
@@ -585,7 +640,7 @@ async fn room_migrate_demo(args: &Args) -> Result<()> {
     info!("A dropped connection, reconnecting...");
 
     // A 重连并迁移会话
-    let a2 = Client::connect(&args.gateway, 3).await?;
+    let a2 = connect(args, &args.gateway, 3).await?;
     let new_cid = a2.wait_conn_id().await;
     a2.resume(a_cid).await?;
     info!("A resumed: conn {} -> {}", new_cid, a2.conn_id());
