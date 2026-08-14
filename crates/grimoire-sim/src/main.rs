@@ -2,6 +2,7 @@
 //!
 //! 模式：
 //!   room       —— MMO 大厅/房间制全流程 demo（两客户端互动作业）
+//!   room-migrate —— 连接迁移 demo（断线重连恢复会话）
 //!   battle     —— 实时对战帧同步 demo（两客户端入局，观察 20Hz 快照广播）
 //!   battle-udp —— 实时对战 UDP 通道 demo（输入与帧同步都走 UDP）
 //!   card       —— 卡牌回合制 demo（两客户端对局，演示权威校验与视角裁剪）
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
-use client::{dec, enc, Client, UdpBattle};
+use client::{dec, enc, Client, UdpBattle, UdpKcp};
 use grimoire_common::msg;
 use grimoire_pb::pb::*;
 use tokio::sync::mpsc;
@@ -50,8 +51,10 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     match args.mode.as_str() {
         "room" => room_demo(&args).await?,
+        "room-migrate" => room_migrate_demo(&args).await?,
         "battle" => battle_demo(&args).await?,
         "battle-udp" => battle_udp_demo(&args).await?,
+        "battle-kcp" => battle_kcp_demo(&args).await?,
         "card" => card_demo(&args).await?,
         "bench" => bench(&args).await?,
         other => anyhow::bail!("unknown mode: {other}"),
@@ -130,7 +133,7 @@ async fn room_demo(args: &Args) -> Result<()> {
 
     let r = a.request(msg::ROOM_LOGIN, enc(&RoomLoginReq { name: "小明".into() })).await?;
     let login = dec::<RoomLoginResp>(&r.payload)?;
-    info!("A logged in player={} name={}", login.player_id, login.name);
+    info!("A logged in player={} name={} games={} wins={}", login.player_id, login.name, login.games, login.wins);
 
     let r = a.request(msg::ROOM_CREATE, enc(&RoomCreateReq { name: "开黑房".into(), capacity: 8 })).await?;
     let room = dec::<RoomCreateResp>(&r.payload)?;
@@ -258,6 +261,69 @@ async fn battle_udp_demo(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// 实时对战 KCP 通道：与 battle-udp 相同流程，但走 KCP 可靠 UDP。
+async fn battle_kcp_demo(args: &Args) -> Result<()> {
+    info!("=== battle-kcp demo ===");
+    let a = Client::connect(&args.gateway, 1).await?;
+    a.start_heartbeat();
+    let b = Client::connect(&args.gateway_b, 2).await?;
+    b.start_heartbeat();
+
+    let r = a.request(msg::BATTLE_JOIN, vec![]).await?;
+    let ja = dec::<BattleJoinResp>(&r.payload)?;
+    let r = b.request(msg::BATTLE_JOIN, vec![]).await?;
+    let jb = dec::<BattleJoinResp>(&r.payload)?;
+    info!("A player {} joined battle#{}, B player {} joined ({}Hz)",
+        ja.player_id, ja.battle_id, jb.player_id, ja.frame_rate);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let a_cid = a.wait_conn_id().await;
+    let b_cid = b.wait_conn_id().await;
+    let ua = UdpKcp::bind(&args.udp_gateway, a_cid).await?;
+    let ub = UdpKcp::bind(&args.udp_gateway, b_cid).await?;
+    info!("KCP 会话绑定完成 (conn {} / {})", a_cid, b_cid);
+
+    // A 持续发输入
+    let ua_send_c = ua.clone();
+    let ua_send = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        let mut t = 0.0_f32;
+        loop {
+            tick.tick().await;
+            t += 0.3;
+            let _ = ua_send_c.send_input(t.cos(), t.sin()).await;
+        }
+    });
+
+    // 两端收 KCP 帧同步
+    let deadline = tokio::time::sleep(Duration::from_secs(4));
+    tokio::pin!(deadline);
+    let mut fa = 0u64;
+    let mut fb = 0u64;
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            r = ua.recv_push() => {
+                if let Ok(Some((_, _, payload))) = r {
+                    if let Ok(p) = dec::<FrameSyncPush>(&payload) {
+                        if p.frame != fa { fa = p.frame; info!("[KCP A] frame#{}: {}", p.frame, fmt_battle(&p.players)); }
+                    }
+                }
+            }
+            r = ub.recv_push() => {
+                if let Ok(Some((_, _, payload))) = r {
+                    if let Ok(p) = dec::<FrameSyncPush>(&payload) {
+                        if p.frame != fb { fb = p.frame; info!("[KCP B] frame#{}: {}", p.frame, fmt_battle(&p.players)); }
+                    }
+                }
+            }
+        }
+    }
+    ua_send.abort();
+    info!("=== battle-kcp demo done ===");
+    Ok(())
+}
+
 fn fmt_battle(players: &[BattlePlayer]) -> String {
     players.iter().map(|p| format!("P{}@({:.0},{:.0})", p.player_id, p.x, p.y)).collect::<Vec<_>>().join(" ")
 }
@@ -280,10 +346,41 @@ async fn card_demo(args: &Args) -> Result<()> {
     let sb = dec::<CardStartResp>(&r.payload)?;
     info!("B started, hand: {}", fmt_hand(sb.state.as_ref()));
 
-    // A 出一张牌（打对面玩家）
-    let r = a.request(msg::CARD_PLAY, enc(&CardPlayReq { hand_index: 0, target_player: 0 })).await?;
-    let p = dec::<CardPlayResp>(&r.payload)?;
-    info!("A plays: ok={} detail={} {}", p.ok, p.detail, fmt_card_state(p.state.as_ref()));
+    // 双方轮流打到对局结束（触发持久化落库）
+    // 出牌成功即自动切换回合；无牌可出时由行动者结束回合
+    let p1_id = sa.state.as_ref().map(|st| st.players[0].player_id).unwrap_or(0);
+    let mut state = sa.state.clone();
+    let mut guard = 0u32;
+    loop {
+        let turn_pid = state.as_ref().map(|st| st.turn_player).unwrap_or(0);
+        let c = if turn_pid == p1_id { &a } else { &b };
+        let r = c.request(msg::CARD_PLAY, enc(&CardPlayReq { hand_index: 0, target_player: 0 })).await?;
+        let p = dec::<CardPlayResp>(&r.payload)?;
+        let finished = p.state.as_ref().map(|st| st.phase == 1).unwrap_or(false);
+        info!("P{} plays: ok={} {} (finished={})", turn_pid, p.ok, p.detail, finished);
+        if finished {
+            info!("对局结束 winner=P{}", p.state.as_ref().map(|st| st.winner).unwrap_or(0));
+            break;
+        }
+        if !p.ok && p.detail.contains("手牌序号无效") {
+            // 无牌可出 → 行动者结束回合，采纳其返回的新状态
+            let r = c.request(msg::CARD_END_TURN, vec![]).await?;
+            if let Ok(e) = dec::<CardEndTurnResp>(&r.payload) {
+                if let Some(s) = e.state {
+                    state = Some(s);
+                }
+            }
+        }
+        // 失败响应的 state 为 None，保留上一状态
+        if let Some(s) = p.state {
+            state = Some(s);
+        }
+        guard += 1;
+        if guard > 40 {
+            info!("对局超过 40 步仍未结束，中止");
+            break;
+        }
+    }
 
     // 非法操作演示：轮到 B，A 再出牌应被拒绝
     let r = a.request(msg::CARD_PLAY, enc(&CardPlayReq { hand_index: 0, target_player: 0 })).await?;
@@ -310,6 +407,62 @@ fn fmt_hand(s: Option<&CardGameState>) -> String {
             .unwrap_or_default(),
         None => "none".into(),
     }
+}
+
+/// 连接迁移 demo：A 建房入局 → 掉线 → 重连并恢复同一会话。
+async fn room_migrate_demo(args: &Args) -> Result<()> {
+    info!("=== room-migrate demo ===");
+    let a = Client::connect(&args.gateway, 1).await?;
+    let a_cid = a.wait_conn_id().await;
+    info!("A connected, conn_id={}", a_cid);
+
+    let r = a.request(msg::ROOM_LOGIN, enc(&RoomLoginReq { name: "小明".into() })).await?;
+    let login = dec::<RoomLoginResp>(&r.payload)?;
+    info!("A logged in player={} name={} games={} wins={}", login.player_id, login.name, login.games, login.wins);
+    let r = a.request(msg::ROOM_CREATE, enc(&RoomCreateReq { name: "开黑房".into(), capacity: 8 })).await?;
+    let room = dec::<RoomCreateResp>(&r.payload)?;
+    info!("A created room #{}", room.room_id);
+
+    let b = Client::connect(&args.gateway_b, 2).await?;
+    let r = b.request(msg::ROOM_LOGIN, enc(&RoomLoginReq { name: "小红".into() })).await?;
+    let login_b = dec::<RoomLoginResp>(&r.payload)?;
+    let _ = b.request(msg::ROOM_JOIN, enc(&RoomJoinReq { room_id: room.room_id })).await?;
+    info!("B(player {}) joined room#{}", login_b.player_id, room.room_id);
+
+    // A 硬掉线（直接断开 TCP，不清理会话）
+    drop(a);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    info!("A dropped connection, reconnecting...");
+
+    // A 重连并迁移会话
+    let a2 = Client::connect(&args.gateway, 3).await?;
+    let new_cid = a2.wait_conn_id().await;
+    a2.resume(a_cid).await?;
+    info!("A resumed: conn {} -> {}", new_cid, a2.conn_id());
+    a2.start_heartbeat();
+
+    // 重新登录：应返回相同 player_id（会话未丢失）
+    let r = a2.request(msg::ROOM_LOGIN, enc(&RoomLoginReq { name: "小明".into() })).await?;
+    let login2 = dec::<RoomLoginResp>(&r.payload)?;
+    info!("A re-login player={} (原 player={})", login2.player_id, login.player_id);
+    assert_eq!(login2.player_id, login.player_id, "会话迁移后 player_id 应保持一致");
+
+    // 房间状态：A 仍应在房间内，成员数=2
+    let r = a2.request(msg::ROOM_LIST, vec![]).await?;
+    let list = dec::<RoomListResp>(&r.payload)?;
+    let room_state = list.rooms.iter().find(|x| x.room_id == room.room_id).cloned();
+    match room_state {
+        Some(rs) => {
+            info!("房间仍存在: members={}", rs.members.len());
+            assert_eq!(rs.members.len(), 2, "迁移后房间成员应保持 2 人");
+            for m in &rs.members {
+                info!("  member P{} name={}", m.player_id, m.name);
+            }
+        }
+        None => anyhow::bail!("迁移后房间丢失了！"),
+    }
+    info!("=== room-migrate demo done ===");
+    Ok(())
 }
 
 /// 压测：N 连接并发发 RoomList，统计 QPS 与延迟分位。

@@ -13,6 +13,9 @@ pub mod msg {
     /// 系统消息：连接建立后网关下发的"欢迎帧"，payload = conn_id(4B 大端)。
     /// 客户端据此拿到全局连接号，用于 UDP 绑定等场景。
     pub const SYS_CONN_ID: u32 = 0x0000_FFFF;
+    /// 系统消息：客户端->网关 连接迁移（断线重连恢复会话）。
+    /// payload = 旧 conn_id(4B 大端)；网关把当前连接重绑到旧 conn_id，原连接被踢。
+    pub const SYS_RESUME: u32 = 0x0000_FFFE;
 
     pub fn domain_of(msg_id: u32) -> u32 {
         msg_id & DOMAIN_MASK

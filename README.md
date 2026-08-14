@@ -30,7 +30,9 @@
 
 1. **多活网关**：`conn_id` 高 8 位编码网关 ID；网关自注册到注册中心，业务服务凭 `conn_id` 定位并推送到对应网关。多实例网关各自独立接入，客户端可分散到不同网关（跨网关对局正常）。
 2. **etcd 注册中心**：注册中心后端可切 etcd——注册=租约+写 key、心跳=keep_alive 续约、发现=前缀 Range。**进程失联时 etcd 租约自动过期删 key**（无需本地扫描器），接口与内存版完全一致。
-3. **UDP 帧同步**：实时对战走 UDP 低延迟通道——客户端 UDP 包首包绑定 `conn_id`，输入经 UDP 上行，帧同步经 UDP 下行；未绑定 UDP 时网关自动回退 TCP。
+3. **UDP/KCP 帧同步**：实时对战走 UDP 低延迟通道——客户端 UDP 包首包绑定 `conn_id`，输入经 UDP 上行，帧同步经 UDP 下行；未绑定 UDP 时网关自动回退 TCP。UDP 通道按首字节自动识别**裸 UDP**（'MU'）与 **KCP 可靠 UDP**（conv=conn_id，小端），KCP 提供可靠有序 + 快重传。
+4. **连接迁移**：客户端断线后重连并发送 `SYS_RESUME`（旧 conn_id），网关把新连接重绑到旧会话（网关侧 8s 宽限、服务侧 15s 宽限），业务服务视角无缝衔接——房间不掉、玩家不丢。
+5. **持久化**：Postgres（权威）+ Redis（缓存）双写玩家档案；登录加载战绩、对局结算 UPSERT 累加（games/wins），服务重启后数据仍在。
 
 ## 快速开始
 
@@ -39,10 +41,13 @@ cargo build --release          # 编译
 bash scripts/start-etcd.sh     # 启动 etcd（推荐后端）
 bash scripts/run-multi.sh      # 启动 registry(etcd)/双网关/三个服务
 # 测试（A 走 gw1、B 走 gw2 的跨网关对局）
-./target/release/grimoire-sim --mode room       --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001
-./target/release/grimoire-sim --mode battle     --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001
-./target/release/grimoire-sim --mode battle-udp --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001 --udp-gateway 127.0.0.1:9020
-./target/release/grimoire-sim --mode card       --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001
+bash scripts/start-pg.sh          # 持久化依赖（Postgres + Redis）
+./target/release/grimoire-sim --mode room          --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001
+./target/release/grimoire-sim --mode room-migrate  --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001  # 连接迁移
+./target/release/grimoire-sim --mode battle        --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001
+./target/release/grimoire-sim --mode battle-udp    --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001 --udp-gateway 127.0.0.1:9020
+./target/release/grimoire-sim --mode battle-kcp    --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001 --udp-gateway 127.0.0.1:9020  # KCP 可靠 UDP
+./target/release/grimoire-sim --mode card          --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001
 ./target/release/grimoire-sim --mode bench --clients 200 --duration 5   # 压测
 bash scripts/stop-all.sh
 ```

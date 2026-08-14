@@ -107,6 +107,9 @@ message RoomLoginReq { string name = 1; }
 message RoomLoginResp {
   uint32 player_id = 1;
   string name = 2;
+  // 持久化战绩（Postgres + Redis）
+  int64 games = 3;
+  int64 wins = 4;
 }
 
 message RoomCreateReq { string name = 1; uint32 capacity = 2; }

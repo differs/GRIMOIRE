@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod discovery;
+mod kcp;
 mod session;
 mod stream;
 
@@ -94,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
     let discovery = discovery::Discovery::new(args.registry.clone()).await?;
     let streams = stream::Streams::new(discovery.clone());
     let (udp_tx, mut udp_rx) = tokio::sync::mpsc::channel::<(SocketAddr, Vec<u8>)>(512);
+    let udp_sock = Arc::new(tokio::net::UdpSocket::bind(&args.udp_listen).await?);
     let ctx = Arc::new(Ctx {
         sessions: Arc::new(DashMap::new()),
         discovery,
@@ -101,6 +103,8 @@ async fn main() -> anyhow::Result<()> {
         next_conn_id: Default::default(),
         gateway_id: args.id,
         udp_tx,
+        kcp_sessions: Arc::new(DashMap::new()),
+        udp_sock: udp_sock.clone(),
     });
 
     // 注册到注册中心（多活网关按 id 区分）
@@ -131,20 +135,24 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // UDP 实时对战通道
-    let udp_sock = Arc::new(tokio::net::UdpSocket::bind(&args.udp_listen).await?);
+    // UDP 实时对战通道（裸 UDP 与 KCP 并存，按首字节自动识别）
     info!("gateway {} udp listening on {}", args.id, args.udp_listen);
     {
         let sock = udp_sock.clone();
         let c = ctx.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0u8; udp::MAX_DATAGRAM];
+            let mut buf = vec![0u8; udp::MAX_DATAGRAM * 2];
             loop {
                 match sock.recv_from(&mut buf).await {
                     Ok((n, src)) => {
                         let c = c.clone();
                         let data = buf[..n].to_vec();
-                        tokio::spawn(session::handle_udp_datagram(c, src, data));
+                        if n >= 2 && &data[0..2] == grimoire_net::udp::MAGIC {
+                            tokio::spawn(session::handle_udp_datagram(c, src, data));
+                        } else if n >= 4 {
+                            let conv = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                            tokio::spawn(session::handle_kcp_datagram(c, conv, src, data));
+                        }
                     }
                     Err(e) => warn!("udp recv error: {}", e),
                 }

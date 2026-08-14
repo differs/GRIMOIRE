@@ -22,5 +22,6 @@ tokio-util.workspace = true
 anyhow.workspace = true
 rand.workspace = true
 prost.workspace = true
+kcp.workspace = true
 
 [dev-dependencies]

@@ -16,10 +16,14 @@ use grimoire_pb::pb::{service_bridge_client::ServiceBridgeClient, ForwardRequest
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::codec::{FramedRead, FramedWrite};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::discovery::Discovery;
+use crate::kcp::{spawn_kcp_driver, KcpSession};
 use crate::stream::Streams;
+
+/// 网关侧会话宽限：断线后保留 conn_id 映射的时间（供连接迁移）
+const SESSION_GRACE: u64 = 8;
 
 pub struct Ctx {
     pub sessions: Arc<DashMap<u32, Arc<Session>>>,
@@ -30,10 +34,14 @@ pub struct Ctx {
     pub gateway_id: u8,
     /// UDP 下行通道：发给 gateway 的 UDP 写任务 (目标地址, 数据报)
     pub udp_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    /// KCP 会话表：conn_id -> KCP 会话（可靠 UDP）
+    pub kcp_sessions: Arc<DashMap<u32, Arc<KcpSession>>>,
+    /// UDP socket（KCP 新建会话/输出用）
+    pub udp_sock: Arc<tokio::net::UdpSocket>,
 }
 
 pub struct Session {
-    pub conn_id: u32,
+    conn_id: AtomicU32,
     tx: mpsc::Sender<Frame>,
     active_domains: Mutex<HashSet<u32>>,
     /// 客户端 UDP 源地址（首次收到其 UDP 包时绑定）
@@ -43,11 +51,22 @@ pub struct Session {
 impl Session {
     pub fn new(conn_id: u32, tx: mpsc::Sender<Frame>) -> Arc<Self> {
         Arc::new(Self {
-            conn_id,
+            conn_id: AtomicU32::new(conn_id),
             tx,
             active_domains: Mutex::new(HashSet::new()),
             udp_addr: Mutex::new(None),
         })
+    }
+
+    pub fn conn_id(&self) -> u32 {
+        self.conn_id.load(Ordering::Relaxed)
+    }
+
+    /// 连接迁移：把会话重绑到旧 conn_id（服务端视角无感）。
+    /// 同时清空玩法域记录，令首个请求重新触发 PlayerConnected 通知。
+    pub async fn rebind(&self, new_id: u32) {
+        self.conn_id.store(new_id, Ordering::Relaxed);
+        self.active_domains.lock().await.clear();
     }
 
     pub async fn send(&self, f: Frame) -> bool {
@@ -81,12 +100,27 @@ impl Session {
         ctx.udp_tx.send((addr, dgram)).await.is_ok()
     }
 
-    /// 下发一条 push：优先 UDP（请求了才用），否则 TCP。
+    /// 下发一条 push：优先 KCP（若已建可靠 UDP 会话）→ 裸 UDP → TCP。
     pub async fn push_msg(&self, ctx: &Ctx, msg_id: u32, payload: Bytes, prefer_udp: bool) -> bool {
-        if prefer_udp && self.send_udp(ctx, msg_id, 0, payload.clone()).await {
-            return true;
+        if prefer_udp {
+            if self.send_kcp(ctx, msg_id, payload.clone()).await {
+                return true;
+            }
+            if self.send_udp(ctx, msg_id, 0, payload.clone()).await {
+                return true;
+            }
+            return self.send(Frame { ptype: PType::Push, msg_id, seq: 0, payload }).await;
         }
         self.send(Frame { ptype: PType::Push, msg_id, seq: 0, payload }).await
+    }
+
+    /// 通过 KCP 会话发送（可靠 UDP）。
+    async fn send_kcp(&self, ctx: &Ctx, msg_id: u32, payload: Bytes) -> bool {
+        let Some(kcps) = ctx.kcp_sessions.get(&self.conn_id()).map(|r| r.clone()) else {
+            return false;
+        };
+        let dgram = udp::peer_packet(self.conn_id(), msg_id, &payload);
+        kcps.send_packet(&dgram)
     }
 }
 
@@ -136,6 +170,9 @@ pub async fn accept_and_serve(ctx: Arc<Ctx>, stream: TcpStream, peer: SocketAddr
             None => break,
         };
         match frame.ptype {
+            PType::Request if frame.msg_id == msg::SYS_RESUME => {
+                handle_resume(&ctx, &session, conn_id, frame).await;
+            }
             PType::Request => {
                 let s = session.clone();
                 let c = ctx.clone();
@@ -154,8 +191,8 @@ pub async fn accept_and_serve(ctx: Arc<Ctx>, stream: TcpStream, peer: SocketAddr
         }
     }
 
-    // 连接结束，清理
-    ctx.sessions.remove(&conn_id);
+    // 连接结束：立即通知业务服务断开（服务端有宽限恢复），
+    // 但会话表保留 SESSION_GRACE 秒供连接迁移重绑。
     let domains = session.domains().await;
     debug!("conn {} closed, notifying domains {:?}", conn_id, domains);
     let c = ctx.clone();
@@ -164,12 +201,74 @@ pub async fn accept_and_serve(ctx: Arc<Ctx>, stream: TcpStream, peer: SocketAddr
             notify_disconnected(&c, domain, conn_id).await;
         }
     });
+    let old_arc = session.clone();
+    let c = ctx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(SESSION_GRACE)).await;
+        // 先取判定值并释放 Ref，再 remove（Ref 存活时 remove 会分片自死锁）
+        let is_current = c
+            .sessions
+            .get(&conn_id)
+            .map(|cur| Arc::ptr_eq(&cur, &old_arc))
+            .unwrap_or(false);
+        if is_current {
+            c.sessions.remove(&conn_id);
+            c.kcp_sessions.remove(&conn_id);
+        }
+    });
+}
+
+/// 连接迁移：把当前连接重绑到旧 conn_id，使业务服务视角无缝衔接。
+async fn handle_resume(ctx: &Ctx, session: &Arc<Session>, new_conn_id: u32, frame: Frame) {
+    let old = if frame.payload.len() == 4 {
+        u32::from_be_bytes([frame.payload[0], frame.payload[1], frame.payload[2], frame.payload[3]])
+    } else {
+        let _ = session
+            .send(Frame {
+                ptype: PType::Response,
+                msg_id: 0,
+                seq: frame.seq,
+                payload: Bytes::from_static(b"err:bad resume payload"),
+            })
+            .await;
+        return;
+    };
+    if old == new_conn_id || !ctx.sessions.contains_key(&old) {
+        let _ = session
+            .send(Frame {
+                ptype: PType::Response,
+                msg_id: 0,
+                seq: frame.seq,
+                payload: Bytes::from_static(b"err:no session to resume"),
+            })
+            .await;
+        return;
+    }
+    // 踢掉旧连接（若仍存活）
+    if let Some((_, old_s)) = ctx.sessions.remove(&old) {
+        let _ = old_s
+            .send(Frame { ptype: PType::Close, msg_id: 0, seq: 0, payload: Bytes::from_static(b"migrated") })
+            .await;
+    }
+    // 把当前会话从新 conn_id 重绑到旧 conn_id
+    ctx.sessions.remove(&new_conn_id);
+    session.rebind(old).await;
+    ctx.sessions.insert(old, session.clone());
+    info!("conn {} resumed as {}", new_conn_id, old);
+    let _ = session
+        .send(Frame {
+            ptype: PType::Response,
+            msg_id: msg::SYS_RESUME,
+            seq: frame.seq,
+            payload: Bytes::copy_from_slice(&old.to_be_bytes()),
+        })
+        .await;
 }
 
 /// 把客户端请求经流式复用转发到对应玩法服务，取回响应并回写。
 async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
     let domain = msg::domain_of(frame.msg_id);
-    debug!("conn {} forward msg 0x{:X} (domain 0x{:X})", session.conn_id, frame.msg_id, domain);
+    debug!("conn {} forward msg 0x{:X} (domain 0x{:X})", session.conn_id(), frame.msg_id, domain);
     let result: Result<(), String> = async {
         let svc_name = crate::discovery::service_for_domain(domain)
             .ok_or_else(|| format!("unknown domain 0x{:X}", domain))?;
@@ -178,15 +277,15 @@ async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
         if session.mark_domain(domain).await {
             if let Some(ch) = ctx.discovery.channel_for(&node.addr).await {
                 let mut client = ServiceBridgeClient::new(ch);
-                let _ = client.player_connected(PlayerEvent { conn_id: session.conn_id }).await;
+                let _ = client.player_connected(PlayerEvent { conn_id: session.conn_id() }).await;
             }
         }
         let conn = ctx.streams.get_or_open(domain, &node).await?;
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        ctx.streams.pending.insert((session.conn_id, frame.seq), resp_tx);
+        ctx.streams.pending.insert((session.conn_id(), frame.seq), resp_tx);
         ctx.streams
             .send(&conn, ForwardRequest {
-                conn_id: session.conn_id,
+                conn_id: session.conn_id(),
                 seq: frame.seq,
                 msg_id: frame.msg_id,
                 payload: frame.payload.to_vec(),
@@ -196,7 +295,7 @@ async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
             .await
             .map_err(|_| "timeout waiting reply".to_string())?
             .map_err(|_| "bridge stream closed".to_string())?;
-        debug!("conn {} got reply for msg 0x{:X}", session.conn_id, frame.msg_id);
+        debug!("conn {} got reply for msg 0x{:X}", session.conn_id(), frame.msg_id);
         let reply_frame = if reply.code != 0 {
             // 业务错误：msg_id=0 + 错误文本（客户端约定）
             Frame { ptype: PType::Response, msg_id: 0, seq: frame.seq, payload: Bytes::from(reply.payload) }
@@ -212,7 +311,7 @@ async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
 
     if let Err(e) = result {
         warn!("forward msg 0x{:X} err: {}", frame.msg_id, e);
-        ctx.streams.pending.remove(&(session.conn_id, frame.seq));
+        ctx.streams.pending.remove(&(session.conn_id(), frame.seq));
         let _ = session
             .send(Frame {
                 ptype: PType::Response,
@@ -224,7 +323,7 @@ async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
     }
 }
 
-/// UDP 数据报入口：绑定 conn <-> 源地址，并把输入转发给业务服务。
+/// UDP 数据报入口：裸 UDP（'MU' 开头）绑定 conn <-> 源地址并转发输入。
 pub async fn handle_udp_datagram(ctx: Arc<Ctx>, src: SocketAddr, data: Vec<u8>) {
     let Some((conn_id, msg_id, payload)) = udp::parse_peer_packet(&data) else {
         return;
@@ -237,6 +336,35 @@ pub async fn handle_udp_datagram(ctx: Arc<Ctx>, src: SocketAddr, data: Vec<u8>) 
     let s = session.clone();
     let c = ctx.clone();
     tokio::spawn(forward_udp(c, s, msg_id, Bytes::copy_from_slice(payload)));
+}
+
+/// KCP 数据报入口：按 conv(前4字节) 定位/创建会话，解出应用载荷后转发。
+pub async fn handle_kcp_datagram(ctx: Arc<Ctx>, conv: u32, src: SocketAddr, data: Vec<u8>) {
+    let session = match ctx.kcp_sessions.get(&conv) {
+        Some(s) => s.clone(),
+        None => {
+            let s = KcpSession::new(conv, ctx.udp_sock.clone(), src);
+            ctx.kcp_sessions.insert(conv, s.clone());
+            // driver 收到会话内数据后回调处理
+            let c = ctx.clone();
+            let on_data = move |pkt: Vec<u8>| {
+                if let Some((conn_id, msg_id, payload)) = udp::parse_peer_packet(&pkt) {
+                    let payload = payload.to_vec();
+                    let c = c.clone();
+                    tokio::spawn(async move {
+                        if let Some(session) = c.sessions.get(&conn_id).map(|r| r.clone()) {
+                            session.bind_udp(src).await;
+                            forward_udp(c.clone(), session, msg_id, Bytes::from(payload)).await;
+                        }
+                    });
+                }
+            };
+            spawn_kcp_driver(ctx.kcp_sessions.clone(), conv, s.clone(), on_data);
+            debug!("new kcp session conv={} from {}", conv, src);
+            s
+        }
+    };
+    let _ = session.inner.lock().unwrap().input(&data);
 }
 
 /// UDP 输入转发（一次性，不回响应；seq=0 的响应会被 reader 丢弃）。
@@ -252,7 +380,7 @@ async fn forward_udp(ctx: Arc<Ctx>, session: Arc<Session>, msg_id: u32, payload:
     if session.mark_domain(domain).await {
         if let Some(ch) = ctx.discovery.channel_for(&node.addr).await {
             let mut client = ServiceBridgeClient::new(ch);
-            let _ = client.player_connected(PlayerEvent { conn_id: session.conn_id }).await;
+            let _ = client.player_connected(PlayerEvent { conn_id: session.conn_id() }).await;
         }
     }
     let Ok(conn) = ctx.streams.get_or_open(domain, &node).await else {
@@ -261,7 +389,7 @@ async fn forward_udp(ctx: Arc<Ctx>, session: Arc<Session>, msg_id: u32, payload:
     let _ = ctx
         .streams
         .send(&conn, ForwardRequest {
-            conn_id: session.conn_id,
+            conn_id: session.conn_id(),
             seq: 0,
             msg_id,
             payload: payload.to_vec(),

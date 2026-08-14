@@ -59,10 +59,10 @@ impl EtcdBackend {
     ) -> anyhow::Result<()> {
         // 撤销旧租约（覆盖注册场景）
         let key0 = (service.to_string(), node_id.to_string());
-        if let Some(old) = self.leases.get(&key0) {
+        let old_lease = self.leases.get(&key0).map(|old| old.lease_id);
+        if let Some(lease_id) = old_lease {
             let mut c = self.client.clone();
-            let _ = c.lease_revoke(old.lease_id).await;
-            drop(old);
+            let _ = c.lease_revoke(lease_id).await;
             self.leases.remove(&key0);
         }
         let ttl = ttl_secs.max(1) as i64;

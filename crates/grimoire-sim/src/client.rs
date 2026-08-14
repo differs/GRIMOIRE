@@ -90,6 +90,35 @@ impl Client {
         self.conn_id.load(Ordering::Relaxed)
     }
 
+    /// 等待欢迎帧下发 conn_id（最多 ~100ms）。
+    pub async fn wait_conn_id(&self) -> u32 {
+        for _ in 0..20 {
+            let cid = self.conn_id();
+            if cid != 0 {
+                return cid;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        0
+    }
+
+    /// 连接迁移后覆盖为本机已知的旧连接号。
+    pub fn set_conn_id(&self, cid: u32) {
+        self.conn_id.store(cid, Ordering::Relaxed);
+    }
+
+    /// 连接迁移：请求网关把当前连接重绑到旧 conn_id（断线重连恢复会话）。
+    pub async fn resume(&self, old_conn_id: u32) -> anyhow::Result<()> {
+        let r = self.request(msg::SYS_RESUME, old_conn_id.to_be_bytes().to_vec()).await?;
+        if r.msg_id == msg::SYS_RESUME && r.payload.len() == 4 {
+            let cid = u32::from_be_bytes([r.payload[0], r.payload[1], r.payload[2], r.payload[3]]);
+            self.set_conn_id(cid);
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("resume failed: {}", String::from_utf8_lossy(&r.payload)))
+        }
+    }
+
     /// 发送请求并等待对应响应（5s 超时）。
     pub async fn request(&self, msg_id: u32, payload: Vec<u8>) -> anyhow::Result<Frame> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
@@ -167,6 +196,116 @@ impl UdpBattle {
         let mut buf = vec![0u8; udp::MAX_DATAGRAM];
         let n = self.sock.recv(&mut buf).await?;
         Ok(udp::parse_push_datagram(&buf[..n]))
+    }
+}
+
+/// KCP 可靠 UDP 对战通道：可靠有序、快重传（kcp 0.3 实现）。
+#[derive(Clone)]
+pub struct UdpKcp {
+    kcp: Arc<std::sync::Mutex<kcp::Kcp<UdpKcpOutput>>>,
+    conn_id: u32,
+    frames: Arc<tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>>,
+}
+
+pub struct UdpKcpOutput {
+    sock: Arc<UdpSocket>,
+    addr: std::net::SocketAddr,
+}
+
+impl std::io::Write for UdpKcpOutput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.sock
+            .try_send_to(buf, self.addr)
+            .map_err(std::io::Error::other)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn now_ms() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u32
+}
+
+impl UdpKcp {
+    /// 绑定 KCP 会话：首包即建立网关侧会话。
+    pub async fn bind(gateway_udp: &str, conn_id: u32) -> anyhow::Result<Self> {
+        let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        let addr: std::net::SocketAddr = gateway_udp.parse()?;
+        let output = UdpKcpOutput { sock: sock.clone(), addr };
+        let mut kcp = kcp::Kcp::new(conn_id, output);
+        kcp.set_nodelay(true, 10, 2, true);
+        kcp.set_wndsize(128, 128);
+        let kcp = Arc::new(std::sync::Mutex::new(kcp));
+
+        let (frames_tx, frames_rx) = mpsc::channel::<Vec<u8>>(128);
+        // 10ms 驱动：读 UDP → input；update（触发发送/重传）；排空 recv
+        let k2 = kcp.clone();
+        let tx2 = frames_tx.clone();
+        let sock2 = sock.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(10));
+            let mut buf = vec![0u8; 8192];
+            loop {
+                tick.tick().await;
+                // 1) UDP 数据包喂给 KCP
+                loop {
+                    match sock2.try_recv_from(&mut buf) {
+                        Ok((n, _)) => {
+                            let _ = k2.lock().unwrap().input(&buf[..n]);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // 2) 时钟驱动 + 排空应用数据
+                let mut received = Vec::new();
+                {
+                    let mut k = k2.lock().unwrap();
+                    let _ = k.update(now_ms());
+                    loop {
+                        let mut b = vec![0u8; 4096];
+                        match k.recv(&mut b) {
+                            Ok(n) => received.push(b[..n].to_vec()),
+                            Err(_) => break,
+                        }
+                    }
+                }
+                for pkt in received {
+                    if tx2.send(pkt).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        // 首包：建立网关侧 KCP 会话（空输入）
+        {
+            let mut k = kcp.lock().unwrap();
+            let pkt = udp::peer_packet(conn_id, msg::BATTLE_INPUT, &[]);
+            let _ = k.send(&pkt);
+            let _ = k.update(now_ms());
+        }
+        let _ = frames_tx;
+        Ok(Self { kcp, conn_id, frames: Arc::new(tokio::sync::Mutex::new(frames_rx)) })
+    }
+
+    pub async fn send_input(&self, dir_x: f32, dir_y: f32) -> anyhow::Result<()> {
+        let payload = grimoire_pb::pb::encode_message(&grimoire_pb::pb::BattleInputReq { dir_x, dir_y });
+        let pkt = udp::peer_packet(self.conn_id, msg::BATTLE_INPUT, &payload);
+        self.kcp.lock().unwrap().send(&pkt)?;
+        Ok(())
+    }
+
+    /// 接收一条应用消息（KCP 解包后的 peer_packet）。
+    pub async fn recv_push(&self) -> anyhow::Result<Option<(u32, u32, Bytes)>> {
+        let mut rx = self.frames.lock().await;
+        match rx.recv().await {
+            Some(pkt) => Ok(udp::parse_peer_packet(&pkt).map(|(_, msg_id, p)| (msg_id, 0, Bytes::copy_from_slice(p)))),
+            None => Ok(None),
+        }
     }
 }
 

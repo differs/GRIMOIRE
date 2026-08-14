@@ -73,12 +73,17 @@ impl Pusher {
         Some(ch)
     }
 
+    /// 推送超时（网关挂起时避免服务端锁/任务被永久卡住）
+    const PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
     /// 向指定连接推送一条服务端消息（TCP）。
     pub async fn push(&self, conn_id: u32, msg_id: u32, payload: Vec<u8>) -> bool {
         let Some(ch) = self.channel_for(conn_id).await else { return false };
         let mut c = GatewayServiceClient::new(ch);
-        c.push(PushRequest { conn_id, msg_id, payload, udp: false })
+        tokio::time::timeout(Self::PUSH_TIMEOUT, c.push(PushRequest { conn_id, msg_id, payload, udp: false }))
             .await
+            .ok()
+            .and_then(|r| r.ok())
             .map(|r| r.into_inner().ok)
             .unwrap_or(false)
     }
@@ -87,8 +92,10 @@ impl Pusher {
     pub async fn push_udp(&self, conn_id: u32, msg_id: u32, payload: Vec<u8>) -> bool {
         let Some(ch) = self.channel_for(conn_id).await else { return false };
         let mut c = GatewayServiceClient::new(ch);
-        c.push(PushRequest { conn_id, msg_id, payload, udp: true })
+        tokio::time::timeout(Self::PUSH_TIMEOUT, c.push(PushRequest { conn_id, msg_id, payload, udp: true }))
             .await
+            .ok()
+            .and_then(|r| r.ok())
             .map(|r| r.into_inner().ok)
             .unwrap_or(false)
     }

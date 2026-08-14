@@ -23,10 +23,10 @@ use grimoire_svcfw::Pusher;
 use rand::seq::SliceRandom;
 use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const GAME_CAPACITY: usize = 2;
-const INIT_HP: u32 = 30;
+const INIT_HP: u32 = 20;
 const HAND_SIZE: usize = 3;
 const PHASE_PLAYING: u32 = 0;
 const PHASE_FINISHED: u32 = 1;
@@ -51,6 +51,10 @@ struct Args {
     registry: String,
     #[arg(long, default_value = "card-svc-1")]
     node_id: String,
+    #[arg(long, default_value = "postgres://grimoire:grimoire@127.0.0.1:5432/grimoire")]
+    pg_url: String,
+    #[arg(long, default_value = "redis://127.0.0.1:6379")]
+    redis_url: String,
 }
 
 struct GamePlayer {
@@ -161,16 +165,18 @@ struct App {
     next_player: AtomicU32,
     next_game: AtomicU32,
     pusher: Pusher,
+    store: Option<Arc<grimoire_svcfw::ProfileStore>>,
 }
 
 impl App {
-    fn new(pusher: Pusher) -> Self {
+    fn new(pusher: Pusher, store: Option<Arc<grimoire_svcfw::ProfileStore>>) -> Self {
         Self {
             games: DashMap::new(),
             conn_game: DashMap::new(),
             next_player: AtomicU32::new(1),
             next_game: AtomicU32::new(1),
             pusher,
+            store,
         }
     }
 
@@ -184,13 +190,13 @@ impl App {
             }
         }
 
-        // 找等待中的局（1 人未满）
+        // 找等待中的局（进行中且 1 人未满，跳过已结束的残局）
         let mut target = None;
         for e in self.games.iter() {
             let gid = *e.key();
             let g = e.value();
             let guard = g.lock().await;
-            if !guard.is_full() {
+            if guard.phase == PHASE_PLAYING && !guard.is_full() {
                 target = Some(gid);
                 break;
             }
@@ -205,22 +211,25 @@ impl App {
             }
         };
 
-        let g = self.games.get(&game_id).unwrap();
-        let mut game = g.value().lock().await;
-        let idx;
-        if game.is_full() {
-            // 理论上不会到这里（新局）
-            idx = 0;
-        } else if game.players.iter().any(|p| p.conn_id == conn_id) {
-            idx = game.player_idx_of(player_id).unwrap_or(0);
-        } else {
-            game.add_player(conn_id, player_id);
-            idx = game.players.len() - 1;
-        }
-        self.conn_game.insert(conn_id, (game_id, idx));
-        let state = game.view_for(idx);
-        let started = game.is_full();
-        drop(game);
+        // 块作用域：Ref 出块即释放，不跨 await
+        let (idx, state, started) = {
+            let g = self.games.get(&game_id).unwrap();
+            let mut game = g.value().lock().await;
+            let idx;
+            if game.is_full() {
+                // 理论上不会到这里（新局）
+                idx = 0;
+            } else if game.players.iter().any(|p| p.conn_id == conn_id) {
+                idx = game.player_idx_of(player_id).unwrap_or(0);
+            } else {
+                game.add_player(conn_id, player_id);
+                idx = game.players.len() - 1;
+            }
+            self.conn_game.insert(conn_id, (game_id, idx));
+            let state = game.view_for(idx);
+            let started = game.is_full();
+            (idx, state, started)
+        };
 
         // 第二人加入后，给先手玩家也推送开局状态
         if started {
@@ -234,67 +243,86 @@ impl App {
         let Some((gid, idx)) = self.conn_game.get(&conn_id).map(|v| *v) else {
             return CardPlayResp { ok: false, detail: "未在对局中".into(), state: None };
         };
-        let g = self.games.get(&gid).unwrap();
-        let mut game = g.value().lock().await;
-
         let fail = |detail: &str| CardPlayResp { ok: false, detail: detail.into(), state: None };
 
-        if game.phase != PHASE_PLAYING {
-            return fail("对局已结束");
-        }
-        if game.turn != idx {
-            return fail("还没轮到你");
-        }
-        if hand_index as usize >= game.players[idx].hand.len() {
-            return fail("手牌序号无效");
-        }
-        // 目标：必须指定另一个玩家（默认自动取对手）
-        let victim = if game.players.len() > 1 {
-            let other = game.players.iter().position(|p| p.player_id != game.players[idx].player_id).unwrap();
-            if target_player != 0 {
-                game.player_idx_of(target_player).filter(|t| *t != idx).unwrap_or(other)
-            } else {
-                other
+        // 全部判定与变更在块内完成，Ref 出块即释放，绝不跨 await
+        let outcome = {
+            let g = self.games.get(&gid).unwrap();
+            let mut game = g.value().lock().await;
+            if game.phase != PHASE_PLAYING {
+                return fail("对局已结束");
             }
-        } else {
-            return fail("对手还没加入");
+            if game.turn != idx {
+                return fail("还没轮到你");
+            }
+            if hand_index as usize >= game.players[idx].hand.len() {
+                return fail("手牌序号无效");
+            }
+            // 目标：必须指定另一个玩家（默认自动取对手）
+            let victim = if game.players.len() > 1 {
+                let other = game.players.iter().position(|p| p.player_id != game.players[idx].player_id).unwrap();
+                if target_player != 0 {
+                    game.player_idx_of(target_player).filter(|t| *t != idx).unwrap_or(other)
+                } else {
+                    other
+                }
+            } else {
+                return fail("对手还没加入");
+            };
+            let card = game.players[idx].hand.remove(hand_index as usize);
+            game.players[victim].hp = game.players[victim].hp.saturating_sub(card.power);
+            game.players[idx].score += card.power;
+            game.check_finish();
+            let finished = game.phase != PHASE_PLAYING;
+            if !finished {
+                game.turn = victim; // 回合切换到对方
+            }
+            (game.view_for(idx), game.winner, finished, format!("{} 造成 {} 点伤害", card.name, card.power))
         };
 
-        let card = game.players[idx].hand.remove(hand_index as usize);
-        game.players[victim].hp = game.players[victim].hp.saturating_sub(card.power);
-        game.players[idx].score += card.power;
-        let mut finished = false;
-        game.check_finish();
-        if game.phase != PHASE_PLAYING {
-            finished = true;
-        } else {
-            game.turn = victim; // 回合切换到对方
+        let (state, winner, finished, detail) = outcome;
+
+        // 对局结束 → 持久化战绩
+        if finished {
+            self.persist_result(gid, winner).await;
         }
-        let state = game.view_for(idx);
-        drop(game);
 
-        let resp = CardPlayResp {
-            ok: true,
-            detail: format!("{} 造成 {} 点伤害", card.name, card.power),
-            state: Some(state),
-        };
+        let resp = CardPlayResp { ok: true, detail, state: Some(state) };
         self.push_snapshot(gid).await;
         info!(game_id = gid, "card played, finished={}", finished);
         resp
+    }
+
+    /// 对局结算落库（Postgres + Redis 失效）。
+    async fn persist_result(&self, game_id: u32, winner: u32) {
+        let Some(store) = &self.store else { return };
+        let Some(g) = self.games.get(&game_id) else { return };
+        let players: Vec<i64> = {
+            let game = g.value().lock().await;
+            game.players.iter().map(|p| p.player_id as i64).collect()
+        };
+        drop(g);
+        if let Err(e) = store.record_game(&players, winner as i64).await {
+            warn!("record_game {} failed: {}", game_id, e);
+        } else {
+            info!("game {} result persisted, winner={}", game_id, winner);
+        }
     }
 
     async fn end_turn(&self, conn_id: u32) -> CardEndTurnResp {
         let Some((gid, idx)) = self.conn_game.get(&conn_id).map(|v| *v) else {
             return CardEndTurnResp { ok: false, state: None };
         };
-        let g = self.games.get(&gid).unwrap();
-        let mut game = g.value().lock().await;
-        if game.phase != PHASE_PLAYING || game.turn != idx {
-            return CardEndTurnResp { ok: false, state: None };
-        }
-        game.turn = (idx + 1) % game.players.len();
-        let state = game.view_for(idx);
-        drop(game);
+        // 块作用域：Ref 出块即释放，不跨 await
+        let state = {
+            let g = self.games.get(&gid).unwrap();
+            let mut game = g.value().lock().await;
+            if game.phase != PHASE_PLAYING || game.turn != idx {
+                return CardEndTurnResp { ok: false, state: None };
+            }
+            game.turn = (idx + 1) % game.players.len();
+            game.view_for(idx)
+        };
         self.push_snapshot(gid).await;
         CardEndTurnResp { ok: true, state: Some(state) }
     }
@@ -472,7 +500,17 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let pusher = Pusher::connect(&args.registry).await?;
-    let app = Arc::new(App::new(pusher));
+    let store = match grimoire_svcfw::ProfileStore::connect(&args.pg_url, &args.redis_url).await {
+        Ok(s) => {
+            info!("persistence enabled (postgres + redis)");
+            Some(Arc::new(s))
+        }
+        Err(e) => {
+            warn!("persistence disabled: {}", e);
+            None
+        }
+    };
+    let app = Arc::new(App::new(pusher, store));
 
     grimoire_svcfw::register_and_heartbeat(
         &args.registry,
