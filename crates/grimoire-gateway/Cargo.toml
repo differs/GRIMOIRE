@@ -1,0 +1,23 @@
+[package]
+name = "grimoire-gateway"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "grimoire-gateway"
+path = "src/main.rs"
+
+[dependencies]
+grimoire-pb = { path = "../grimoire-pb" }
+grimoire-net = { path = "../grimoire-net" }
+grimoire-common = { path = "../grimoire-common" }
+tokio.workspace = true
+tonic.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+tokio-util.workspace = true
+anyhow.workspace = true

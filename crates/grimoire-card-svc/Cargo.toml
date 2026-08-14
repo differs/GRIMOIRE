@@ -1,0 +1,22 @@
+[package]
+name = "grimoire-card-svc"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "grimoire-card-svc"
+path = "src/main.rs"
+
+[dependencies]
+grimoire-pb = { path = "../grimoire-pb" }
+grimoire-common = { path = "../grimoire-common" }
+grimoire-svcfw = { path = "../grimoire-svcfw" }
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+dashmap.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+prost.workspace = true

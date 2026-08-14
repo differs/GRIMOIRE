@@ -1,0 +1,26 @@
+[package]
+name = "grimoire-sim"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "grimoire-sim"
+path = "src/main.rs"
+
+[dependencies]
+grimoire-pb = { path = "../grimoire-pb" }
+grimoire-common = { path = "../grimoire-common" }
+grimoire-net = { path = "../grimoire-net" }
+tokio.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+tokio-util.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+prost.workspace = true
+
+[dev-dependencies]

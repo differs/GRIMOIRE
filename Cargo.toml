@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/grimoire-net",
+    "crates/grimoire-pb",
+    "crates/grimoire-common",
+    "crates/grimoire-svcfw",
+    "crates/grimoire-registry",
+    "crates/grimoire-gateway",
+    "crates/grimoire-room-svc",
+    "crates/grimoire-battle-svc",
+    "crates/grimoire-card-svc",
+    "crates/grimoire-sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+prost = "0.13"
+tonic = { version = "0.12", features = ["transport", "tls"] }
+tonic-build = { version = "0.12", features = ["prost"] }
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+dashmap = "6"
+rand = "0.8"
+tokio-util = { version = "0.7", features = ["codec"] }
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

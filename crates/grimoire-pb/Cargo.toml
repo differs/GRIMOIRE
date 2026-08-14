@@ -1,0 +1,13 @@
+[package]
+name = "grimoire-pb"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+protoc-bin-vendored.workspace = true

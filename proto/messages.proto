@@ -1,0 +1,224 @@
+syntax = "proto3";
+package grimoire;
+
+// ============================================================
+// TCP 帧协议（不属于 protobuf，纯协议层约定）
+//  偏移  字段    大小  说明
+//  0     magic   2    'MT' (0x4D54)
+//  2     ver     1    =1
+//  3     ptype   1    0=request 1=response 2=push 3=heartbeat 4=close
+//  4     msg_id  4    big-endian；高8位=玩法域(1 room 2 battle 3 card)，低24位=消息号
+//  8     seq     4    big-endian；请求序号，响应原样带回
+//  12    len     4    big-endian；payload 字节数
+//  16+   payload      protobuf 编码的业务消息
+// ============================================================
+
+// ---------- Gateway <-> Service 桥接 ----------
+service GatewayService {
+  // 业务服务 -> 网关：主动推送/下发到某连接
+  rpc Push(PushRequest) returns (PushReply);
+  // 业务服务 -> 网关：踢掉某连接
+  rpc Kick(KickRequest) returns (KickReply);
+}
+
+message PushRequest {
+  uint32 conn_id = 1;
+  uint32 msg_id = 2;
+  bytes payload = 3;
+}
+message PushReply { bool ok = 1; }
+message KickRequest {
+  uint32 conn_id = 1;
+  uint32 reason = 2;
+  string detail = 3;
+}
+message KickReply { bool ok = 1; }
+
+service ServiceBridge {
+  // 网关 -> 业务服务：转发客户端请求，返回响应 payload
+  rpc HandleMessage(ForwardRequest) returns (ForwardReply);
+  // 网关 -> 业务服务：连接建立事件（登录后）
+  rpc PlayerConnected(PlayerEvent) returns (EventReply);
+  // 网关 -> 业务服务：连接断开事件
+  rpc PlayerDisconnected(PlayerEvent) returns (EventReply);
+}
+
+message ForwardRequest {
+  uint32 conn_id = 1;
+  uint32 seq = 2;
+  uint32 msg_id = 3;
+  bytes payload = 4;
+}
+message ForwardReply { bytes payload = 1; }
+message PlayerEvent { uint32 conn_id = 1; }
+message EventReply { bool ok = 1; }
+
+// ---------- 服务注册中心 ----------
+service RegistryService {
+  rpc Register(RegisterRequest) returns (RegisterReply);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+  rpc Discover(DiscoverRequest) returns (DiscoverReply);
+  rpc Unregister(UnregisterRequest) returns (UnregisterReply);
+}
+
+message RegisterRequest {
+  string service = 1;      // 服务名，如 "gateway"/"room-svc"/"battle-svc"/"card-svc"
+  string node_id = 2;      // 节点唯一 ID，如 "room-svc-1"
+  string addr = 3;         // "host:port"
+  map<string, string> meta = 4;
+  int32 ttl_secs = 5;      // 租约秒数，需在 TTL 内续约
+}
+message RegisterReply { bool ok = 1; }
+message HeartbeatRequest {
+  string service = 1;
+  string node_id = 2;
+}
+message HeartbeatReply { bool ok = 1; }
+message DiscoverRequest { string service = 1; }
+message NodeInfo {
+  string node_id = 1;
+  string addr = 2;
+  map<string, string> meta = 3;
+}
+message DiscoverReply { repeated NodeInfo nodes = 1; }
+message UnregisterRequest {
+  string service = 1;
+  string node_id = 2;
+}
+message UnregisterReply { bool ok = 1; }
+
+// ============================================================
+// 玩法一：MMO 大厅/房间制（room-svc）
+//   范式：请求/响应 + 房间内全量状态广播（低频）
+// ============================================================
+message RoomLoginReq { string name = 1; }
+message RoomLoginResp {
+  uint32 player_id = 1;
+  string name = 2;
+}
+
+message RoomCreateReq { string name = 1; uint32 capacity = 2; }
+message RoomCreateResp { uint32 room_id = 1; }
+
+message RoomJoinReq { uint32 room_id = 1; }
+message RoomJoinResp { RoomInfo room = 1; }
+
+message RoomLeaveReq {}
+message RoomLeaveResp {}
+
+message RoomListReq {}
+message RoomListResp { repeated RoomInfo rooms = 1; }
+
+message RoomChatReq { string text = 1; }
+message RoomChatResp {}
+
+message RoomInfo {
+  uint32 room_id = 1;
+  string name = 2;
+  uint32 capacity = 3;
+  repeated RoomMember members = 4;
+}
+message RoomMember {
+  uint32 player_id = 1;
+  string name = 2;
+}
+
+// 推送给房间内所有人的状态更新
+message RoomStatePush {
+  string event = 1;       // join/leave/chat/state
+  uint32 actor_id = 2;
+  RoomInfo room = 3;
+}
+message RoomChatPush {
+  uint32 room_id = 1;
+  uint32 player_id = 2;
+  string name = 3;
+  string text = 4;
+}
+
+// ============================================================
+// 玩法二：实时对战（battle-svc）
+//   范式：帧同步，服务端按固定 tick 权威广播世界快照
+// ============================================================
+message BattleJoinReq {}
+message BattleJoinResp {
+  uint32 battle_id = 1;
+  uint32 player_id = 2;
+  uint32 frame_rate = 3;   // 本战斗 tick 率
+  repeated BattlePlayer players = 4;
+}
+
+message BattleInputReq {
+  float dir_x = 1;         // 移动方向向量
+  float dir_y = 2;
+}
+message BattleInputResp {}
+
+message BattleLeaveReq {}
+message BattleLeaveResp {}
+
+message BattlePlayer {
+  uint32 player_id = 1;
+  float x = 2;
+  float y = 3;
+  uint32 score = 4;
+}
+
+// 服务端每 tick 推送给战斗内所有玩家
+message FrameSyncPush {
+  uint64 frame = 1;
+  uint32 battle_id = 2;
+  repeated BattlePlayer players = 3;
+}
+
+// ============================================================
+// 玩法三：卡牌回合制（card-svc）
+//   范式：事件驱动 + 状态机 + 服务端权威校验
+// ============================================================
+message CardStartReq {}
+message CardStartResp { CardGameState state = 1; }
+
+message CardPlayReq {
+  uint32 hand_index = 1;
+  uint32 target_player = 2;
+}
+message CardPlayResp {
+  bool ok = 1;
+  string detail = 2;
+  CardGameState state = 3;
+}
+
+message CardEndTurnReq {}
+message CardEndTurnResp {
+  bool ok = 1;
+  CardGameState state = 2;
+}
+
+message CardStateReq {}
+message CardStateResp { CardGameState state = 1; }
+
+message CardDef {
+  uint32 id = 1;
+  string name = 2;
+  uint32 power = 3;
+}
+message CardPlayerView {
+  uint32 player_id = 1;
+  string name = 2;
+  uint32 hp = 3;
+  uint32 score = 4;
+  // 手牌：自己视角可见明细，他人视角只有数量
+  repeated CardDef hand = 5;
+  uint32 hand_count = 6;
+}
+
+message CardGameState {
+  uint32 game_id = 1;
+  uint32 turn_player = 2;   // 当前出牌玩家
+  uint32 phase = 3;         // 0=playing 1=finished
+  uint32 winner = 4;
+  repeated CardPlayerView players = 5;
+}
+
+// 回合推进/出牌结果推送
+message CardSnapshotPush { CardGameState state = 1; }

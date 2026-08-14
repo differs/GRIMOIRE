@@ -1,0 +1,7 @@
+[package]
+name = "grimoire-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+grimoire-pb = { path = "../grimoire-pb" }

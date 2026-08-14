@@ -1,0 +1,13 @@
+[package]
+name = "grimoire-svcfw"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+grimoire-pb = { path = "../grimoire-pb" }
+grimoire-net = { path = "../grimoire-net" }
+tokio.workspace = true
+tonic.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

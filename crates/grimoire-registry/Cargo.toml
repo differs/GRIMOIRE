@@ -1,0 +1,16 @@
+[package]
+name = "grimoire-registry"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "grimoire-registry"
+path = "src/main.rs"
+
+[dependencies]
+grimoire-pb = { path = "../grimoire-pb" }
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
