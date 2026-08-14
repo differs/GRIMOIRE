@@ -85,17 +85,33 @@ crates/
 - **battle-svc**：`tokio::time::interval(50ms)` 全局模拟节拍；每帧按玩家最近输入做确定性位移模拟，向战斗内所有连接广播同一份 `FrameSyncPush`（UDP）。客户端看到的第 N 帧与所有人完全一致。
 - **card-svc**：`phase + turn` 状态机；出牌/结束回合全部服务端校验；快照按接收者视角裁剪（自己见手牌明细、对手只见数量）。
 
-## 踩坑记录（DashMap 自死锁）
+## 踩坑记录（DashMap 锁 & 运行时冻结）
 
-DashMap 的 `get()/get_mut()/iter()` 返回的 `Ref` 持有分片**同步读锁**，若在 Ref 存活期间再对同一分片调 `remove()/get_mut()` 请求**写锁**，parking_lot 写优先会让该线程自死锁——且因为它是同步锁，会**阻塞整个 tokio worker 线程**，连锁把定时器/心跳全部卡死。修复模式：先 `drop` 释放 Ref 再写。
+DashMap 的 `get()/get_mut()/iter()` 返回的 `Ref` 持有分片**同步读锁**，parking_lot 写优先。两个高危模式会**阻塞整个 tokio worker 线程**，连锁卡死定时器/心跳，进程看起来活着但完全僵死：
 
-## 压测对比
+1. **自死锁**：Ref 存活期间对同一分片 `remove()/get_mut()`（写锁）——battle/card 的 `leave()`。
+2. **锁跨 await 死锁**：持有 A 分片读锁时 `await` 另一把锁，而持后者写锁的路径又在等 A 分片写锁——gateway `resolve()` 的缓存 Ref 跨 `last_fetch.read().await`，与 `fetch()` 的 `last_fetch` 写锁 + cache 写锁互相等待。
 
-| 构建 | 并发连接 | QPS | p50 | p99 |
+修复原则：**任何 await 期间不持有 DashMap Ref / 同步锁**；先用 `clone()/drop()` 取出数据再异步操作。
+
+## 压测对比（release + etcd 注册中心）
+
+| 版本 | 并发连接 | QPS | p50 | p99 |
 |---|---|---|---|---|
-| debug | 200 | ~2.3k | 82ms | 139ms |
-| release | 200 | ~20.6k | 9.4ms | 17ms |
-| release | 500 | ~23.7k | 20.6ms | 34ms |
+| 初始（单网关、内存注册） | 200 | ~20.6k | 9.4ms | 17ms |
+| 优化前（etcd、双网关） | 200 | ~37.9k | 5.2ms | 8.0ms |
+| **优化后** | 200 | **~55.3k** | **3.6ms** | **6.4ms** |
+| 优化后 | 500 | ~60.9k | 8.1ms | 14.7ms |
+| 优化后 | 1000 | ~59.8k | 16.2ms | 29.6ms |
+
+单连接本征 RTT 约 133µs（客户端→网关→业务服务→返回，含 gRPC）。
+
+## 性能优化记录（按收益排序）
+
+1. **网关→服务 h2 连接池**（最大收益）：单条 h2 连接在高并发 unary RPC 下流锁竞争严重，`channel_for` 改为每节点 4 条连接轮询。
+2. **TCP_NODELAY**：网关接入 socket 与客户端均关闭 Nagle，避免小包延迟叠加。
+3. **发现缓存零克隆**：`Discovery::resolve` 原实现每请求克隆整个节点 Vec（含 String），改为 `Arc<NodeInfo>` 缓存只克隆 Arc。
+4. 吞吐上限 ~60k QPS 由"每条游戏消息一次 unary RPC"的架构成本决定（h2 流创建/头处理/序列化），进一步优化需流式多路复用或协议层批处理。
 
 ## 已知简化 & 后续路线
 

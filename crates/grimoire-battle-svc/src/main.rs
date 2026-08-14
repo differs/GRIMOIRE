@@ -110,7 +110,7 @@ impl Battle {
 }
 
 struct App {
-    battles: DashMap<u32, Mutex<Battle>>,
+    battles: DashMap<u32, Arc<Mutex<Battle>>>,
     /// conn_id -> (battle_id, player_id)
     conn_battle: DashMap<u32, (u32, u32)>,
     next_player: AtomicU32,
@@ -152,7 +152,7 @@ impl App {
             Some(id) => id,
             None => {
                 let id = self.next_battle.fetch_add(1, Ordering::Relaxed);
-                self.battles.insert(id, Mutex::new(Battle::new(id)));
+                self.battles.insert(id, Arc::new(Mutex::new(Battle::new(id))));
                 id
             }
         };
@@ -208,8 +208,13 @@ impl App {
 
     /// 20Hz 全局模拟节拍。
     async fn tick(&self) {
-        for e in self.battles.iter() {
-            let b = e.value();
+        // 先把 Arc<Mutex> 快照出来，绝不在 DashMap 迭代锁内 await
+        let battles: Vec<(u32, Arc<Mutex<Battle>>)> = self
+            .battles
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        for (_bid, b) in battles {
             let (payload, targets) = {
                 let mut battle = b.lock().await;
                 battle.tick_frame();

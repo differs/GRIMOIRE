@@ -27,6 +27,7 @@ pub struct Client {
 impl Client {
     pub async fn connect(addr: &str, conn_id_label: u32) -> anyhow::Result<Self> {
         let stream = TcpStream::connect(addr).await.context("connect gateway")?;
+        let _ = stream.set_nodelay(true);
         let (read_half, write_half) = stream.into_split();
 
         let (tx, mut tx_rx) = mpsc::channel::<Frame>(128);

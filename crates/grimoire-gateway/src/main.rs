@@ -46,7 +46,8 @@ struct GatewayGrpc {
 impl GatewayService for GatewayGrpc {
     async fn push(&self, request: Request<PushRequest>) -> Result<Response<PushReply>, Status> {
         let req = request.into_inner();
-        let ok = match self.ctx.sessions.get(&req.conn_id) {
+        // 先把 Arc 克隆出 Ref 再 await，避免 Ref 跨 await 持有分片读锁
+        let ok = match self.ctx.sessions.get(&req.conn_id).map(|r| r.clone()) {
             Some(s) => {
                 debug!("push conn {} msg 0x{:X} udp={}", req.conn_id, req.msg_id, req.udp);
                 s.push_msg(&self.ctx, req.msg_id, req.payload.into(), req.udp).await

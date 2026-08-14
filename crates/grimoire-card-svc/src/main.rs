@@ -323,6 +323,7 @@ impl App {
                 })))
                 .collect()
         };
+        drop(g); // 释放分片读锁后再推送，避免锁跨 await
         for (conn, payload) in targets {
             let _ = self.pusher.push(conn, msg::CARD_SNAPSHOT_PUSH, payload).await;
         }

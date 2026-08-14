@@ -88,6 +88,8 @@ impl Session {
 }
 
 pub async fn accept_and_serve(ctx: Arc<Ctx>, stream: TcpStream, peer: SocketAddr) {
+    // 游戏服务器标配：禁用 Nagle，避免小包延迟叠加
+    let _ = stream.set_nodelay(true);
     let local = ctx.next_conn_id.fetch_add(1, Ordering::Relaxed);
     let conn_id = conn::make(ctx.gateway_id, local);
     let (read_half, write_half) = stream.into_split();
