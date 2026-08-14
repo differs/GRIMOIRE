@@ -31,6 +31,9 @@ struct Args {
     /// 客户端 A 所在网关的 UDP 端口（battle-udp 用）
     #[arg(long, default_value = "127.0.0.1:9020")]
     udp_gateway: String,
+    /// 客户端 B 所在网关的 UDP 端口（多网关时指向另一实例）
+    #[arg(long, default_value = "127.0.0.1:9020")]
+    udp_gateway_b: String,
     #[arg(long, default_value = "room")]
     mode: String,
     /// bench 模式：并发连接数
@@ -58,6 +61,7 @@ async fn main() -> Result<()> {
         "battle" => battle_demo(&args).await?,
         "battle-udp" => battle_udp_demo(&args).await?,
         "battle-kcp" => battle_kcp_demo(&args).await?,
+        "battle-stress" => battle_stress_demo(&args).await?,
         "card" => card_demo(&args).await?,
         "bench" => bench(&args).await?,
         other => anyhow::bail!("unknown mode: {other}"),
@@ -283,7 +287,7 @@ async fn battle_kcp_demo(args: &Args) -> Result<()> {
     let a_cid = a.wait_conn_id().await;
     let b_cid = b.wait_conn_id().await;
     let ua = UdpKcp::bind(&args.udp_gateway, a_cid).await?;
-    let ub = UdpKcp::bind(&args.udp_gateway, b_cid).await?;
+    let ub = UdpKcp::bind(&args.udp_gateway_b, b_cid).await?;
     info!("KCP 会话绑定完成 (conn {} / {})", a_cid, b_cid);
 
     // A 持续发输入
@@ -329,6 +333,113 @@ async fn battle_kcp_demo(args: &Args) -> Result<()> {
 
 fn fmt_battle(players: &[BattlePlayer]) -> String {
     players.iter().map(|p| format!("P{}@({:.0},{:.0})", p.player_id, p.x, p.y)).collect::<Vec<_>>().join(" ")
+}
+
+/// KCP 对战压测：N 个客户端（2 人/局），KCP 通道收发帧同步。
+/// 统计帧同步到达率、乱序/丢帧情况与单帧延迟。
+async fn battle_stress_demo(args: &Args) -> Result<()> {
+    let n = args.clients.max(2);
+    let n = n - n % 2;
+    info!("=== battle-stress: {} 客户端, {} 局, {}s, KCP ===", n, n / 2, args.duration);
+
+    let clients: Vec<Client> = {
+        let mut v = Vec::new();
+        for i in 0..n {
+            let gw = if i % 2 == 0 { args.gateway.clone() } else { args.gateway_b.clone() };
+            match Client::connect(&gw, i as u32).await {
+                Ok(c) => v.push(c),
+                Err(e) => {
+                    info!("client {} connect fail: {}", i, e);
+                    return Ok(());
+                }
+            }
+        }
+        v
+    };
+    // 全部入局
+    for c in &clients {
+        let _ = c.request(msg::BATTLE_JOIN, vec![]).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    info!("joined {} clients", clients.len());
+
+    // 各自建立 KCP 会话并发输入（按奇偶选对应网关的 UDP 端口）
+    let dur = args.duration;
+    let udp_a = args.udp_gateway.clone();
+    let udp_b = args.udp_gateway_b.clone();
+    let mut handles = Vec::new();
+    for (i, c) in clients.into_iter().enumerate() {
+        let cid = c.wait_conn_id().await;
+        let udp = if i % 2 == 0 { udp_a.clone() } else { udp_b.clone() };
+        handles.push(tokio::spawn(async move {
+            // 持有客户端以保持 TCP 连接存活（Drop 会关闭连接导致被踢出战斗）
+            let _keep_client = c;
+            let Ok(kcp) = UdpKcp::bind(&udp, cid).await else {
+                info!("client {} kcp bind fail", cid);
+                return (0u64, 0u64, Duration::ZERO);
+            };
+            let mut frames = 0u64;
+            let mut prev = 0u64;
+            let mut gaps = 0u64;
+            let mut sum_lat = Duration::ZERO;
+            let mut last_recv = Instant::now();
+            let deadline = tokio::time::sleep(Duration::from_secs(dur));
+            tokio::pin!(deadline);
+            // 输入循环
+            let input = tokio::spawn({
+                let k = kcp.clone();
+                async move {
+                    let mut tick = tokio::time::interval(Duration::from_millis(50));
+                    let mut t = 0.0_f32;
+                    loop {
+                        tick.tick().await;
+                        t += 0.3;
+                        let _ = k.send_input(t.cos(), t.sin()).await;
+                    }
+                }
+            });
+            loop {
+                tokio::select! {
+                    _ = &mut deadline => break,
+                    r = kcp.recv_push() => {
+                        if let Ok(Some((_, _, payload))) = r {
+                            if let Ok(p) = dec::<FrameSyncPush>(&payload) {
+                                let t0 = Instant::now();
+                                frames += 1;
+                                if prev != 0 && p.frame != prev + 1 { gaps += 1; }
+                                prev = p.frame;
+                                if frames > 1 { sum_lat += t0.duration_since(last_recv); }
+                                last_recv = t0;
+                            }
+                        }
+                    }
+                }
+            }
+            input.abort();
+            info!("client {} kcp frames={} gaps={} last_frame={}", cid, frames, gaps, prev);
+            (frames, gaps, sum_lat)
+        }));
+    }
+    let mut total_frames = 0u64;
+    let mut total_gaps = 0u64;
+    let mut total_lat = Duration::ZERO;
+    let mut cnt = 0u64;
+    for h in handles {
+        if let Ok((f, g, l)) = h.await {
+            total_frames += f;
+            total_gaps += g;
+            total_lat += l;
+            cnt += 1;
+        }
+    }
+    let per = if cnt > 0 { total_frames as f64 / cnt as f64 } else { 0.0 };
+    info!(
+        "KCP 结果: {} 客户端, 总帧数={}, 每客户端平均帧={:.0} ({:.1}Hz), 乱序/丢帧={}, 平均帧延迟={:?}",
+        cnt, total_frames, per, per / args.duration as f64, total_gaps,
+        total_lat.checked_div(total_frames.max(1) as u32)
+    );
+    info!("=== battle-stress done ===");
+    Ok(())
 }
 
 async fn card_demo(args: &Args) -> Result<()> {
