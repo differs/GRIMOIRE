@@ -1,6 +1,7 @@
 //! 客户端连接会话：读写循环、请求转发、UDP 绑定、清理。
 
 use std::collections::HashSet;
+use std::time::Duration;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -18,10 +19,12 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, warn};
 
 use crate::discovery::Discovery;
+use crate::stream::Streams;
 
 pub struct Ctx {
     pub sessions: Arc<DashMap<u32, Arc<Session>>>,
     pub discovery: Arc<Discovery>,
+    pub streams: Arc<Streams>,
     pub next_conn_id: AtomicU32,
     /// 本网关 ID（写进 conn_id 高 8 位，全局唯一）
     pub gateway_id: u8,
@@ -163,7 +166,7 @@ pub async fn accept_and_serve(ctx: Arc<Ctx>, stream: TcpStream, peer: SocketAddr
     });
 }
 
-/// 把客户端请求转发到对应玩法服务，取回响应并回写。
+/// 把客户端请求经流式复用转发到对应玩法服务，取回响应并回写。
 async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
     let domain = msg::domain_of(frame.msg_id);
     debug!("conn {} forward msg 0x{:X} (domain 0x{:X})", session.conn_id, frame.msg_id, domain);
@@ -171,25 +174,34 @@ async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
         let svc_name = crate::discovery::service_for_domain(domain)
             .ok_or_else(|| format!("unknown domain 0x{:X}", domain))?;
         let node = ctx.discovery.resolve(domain).await.ok_or_else(|| format!("no {} available", svc_name))?;
-        let ch = ctx.discovery.channel_for(&node.addr).await.ok_or_else(|| format!("cannot connect {}", node.addr))?;
-        let mut client = ServiceBridgeClient::new(ch);
-        // 首次进入该玩法域时通知业务服务
+        // 首次进入该玩法域时通知业务服务（低频，unary 即可）
         if session.mark_domain(domain).await {
-            let _ = client.player_connected(PlayerEvent { conn_id: session.conn_id }).await;
+            if let Some(ch) = ctx.discovery.channel_for(&node.addr).await {
+                let mut client = ServiceBridgeClient::new(ch);
+                let _ = client.player_connected(PlayerEvent { conn_id: session.conn_id }).await;
+            }
         }
-        let req = tonic::Request::new(ForwardRequest {
-            conn_id: session.conn_id,
-            seq: frame.seq,
-            msg_id: frame.msg_id,
-            payload: frame.payload.to_vec(),
-        });
-        let resp = client.handle_message(req).await.map_err(|e| e.to_string())?;
+        let conn = ctx.streams.get_or_open(domain, &node).await?;
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        ctx.streams.pending.insert((session.conn_id, frame.seq), resp_tx);
+        ctx.streams
+            .send(&conn, ForwardRequest {
+                conn_id: session.conn_id,
+                seq: frame.seq,
+                msg_id: frame.msg_id,
+                payload: frame.payload.to_vec(),
+            })
+            .await?;
+        let reply = tokio::time::timeout(Duration::from_secs(5), resp_rx)
+            .await
+            .map_err(|_| "timeout waiting reply".to_string())?
+            .map_err(|_| "bridge stream closed".to_string())?;
         debug!("conn {} got reply for msg 0x{:X}", session.conn_id, frame.msg_id);
-        let reply_frame = Frame {
-            ptype: PType::Response,
-            msg_id: frame.msg_id,
-            seq: frame.seq,
-            payload: Bytes::from(resp.into_inner().payload),
+        let reply_frame = if reply.code != 0 {
+            // 业务错误：msg_id=0 + 错误文本（客户端约定）
+            Frame { ptype: PType::Response, msg_id: 0, seq: frame.seq, payload: Bytes::from(reply.payload) }
+        } else {
+            Frame { ptype: PType::Response, msg_id: reply.msg_id, seq: reply.seq, payload: Bytes::from(reply.payload) }
         };
         if !session.send(reply_frame).await {
             return Err("session closed".into());
@@ -200,10 +212,11 @@ async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
 
     if let Err(e) = result {
         warn!("forward msg 0x{:X} err: {}", frame.msg_id, e);
+        ctx.streams.pending.remove(&(session.conn_id, frame.seq));
         let _ = session
             .send(Frame {
                 ptype: PType::Response,
-                msg_id: frame.msg_id,
+                msg_id: 0,
                 seq: frame.seq,
                 payload: Bytes::from(format!("err:{}", e)),
             })
@@ -226,7 +239,7 @@ pub async fn handle_udp_datagram(ctx: Arc<Ctx>, src: SocketAddr, data: Vec<u8>) 
     tokio::spawn(forward_udp(c, s, msg_id, Bytes::copy_from_slice(payload)));
 }
 
-/// UDP 输入转发（一次性，不回响应）。
+/// UDP 输入转发（一次性，不回响应；seq=0 的响应会被 reader 丢弃）。
 async fn forward_udp(ctx: Arc<Ctx>, session: Arc<Session>, msg_id: u32, payload: Bytes) {
     let domain = msg::domain_of(msg_id);
     let Ok(svc_name) = crate::discovery::service_for_domain(domain).ok_or_else(|| "unknown domain") else {
@@ -236,13 +249,18 @@ async fn forward_udp(ctx: Arc<Ctx>, session: Arc<Session>, msg_id: u32, payload:
         warn!("udp forward: no {} available", svc_name);
         return;
     };
-    let Some(ch) = ctx.discovery.channel_for(&node.addr).await else { return };
-    let mut client = ServiceBridgeClient::new(ch);
     if session.mark_domain(domain).await {
-        let _ = client.player_connected(PlayerEvent { conn_id: session.conn_id }).await;
+        if let Some(ch) = ctx.discovery.channel_for(&node.addr).await {
+            let mut client = ServiceBridgeClient::new(ch);
+            let _ = client.player_connected(PlayerEvent { conn_id: session.conn_id }).await;
+        }
     }
-    let _ = client
-        .handle_message(ForwardRequest {
+    let Ok(conn) = ctx.streams.get_or_open(domain, &node).await else {
+        return;
+    };
+    let _ = ctx
+        .streams
+        .send(&conn, ForwardRequest {
             conn_id: session.conn_id,
             seq: 0,
             msg_id,

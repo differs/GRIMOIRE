@@ -233,31 +233,79 @@ struct Bridge {
     app: Arc<App>,
 }
 
+/// 统一请求分发：unary 与流式共用，错误走 code=1。
+async fn process(app: &Arc<App>, req: ForwardRequest) -> ForwardReply {
+    debug!("battle handle msg 0x{:X} from conn {}", req.msg_id, req.conn_id);
+    let reply = |payload: Vec<u8>| ForwardReply {
+        conn_id: req.conn_id,
+        seq: req.seq,
+        msg_id: req.msg_id,
+        code: 0,
+        payload,
+    };
+    let err = |text: String| ForwardReply {
+        conn_id: req.conn_id,
+        seq: req.seq,
+        msg_id: req.msg_id,
+        code: 1,
+        payload: text.into_bytes(),
+    };
+    match req.msg_id {
+        msg::BATTLE_JOIN => match dec::<BattleJoinReq>(&req.payload) {
+            Ok(_) => reply(encode(&app.join(req.conn_id).await)),
+            Err(e) => err(format!("bad payload: {e}")),
+        },
+        msg::BATTLE_INPUT => match dec::<BattleInputReq>(&req.payload) {
+            Ok(m) => {
+                app.input(req.conn_id, m.dir_x, m.dir_y).await;
+                reply(encode(&BattleInputResp {}))
+            }
+            Err(e) => err(format!("bad payload: {e}")),
+        },
+        msg::BATTLE_LEAVE => {
+            app.leave(req.conn_id).await;
+            reply(encode(&BattleLeaveResp {}))
+        }
+        _ => err(format!("unknown msg_id 0x{:X}", req.msg_id)),
+    }
+}
+
 #[tonic::async_trait]
 impl ServiceBridge for Bridge {
+    type BridgeStreamStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<ForwardReply, tonic::Status>> + Send>,
+    >;
+
     async fn handle_message(
         &self,
         request: Request<ForwardRequest>,
     ) -> Result<Response<ForwardReply>, Status> {
-        let req = request.into_inner();
-        let app = &self.app;
-        let payload = match req.msg_id {
-            msg::BATTLE_JOIN => {
-                let _m: BattleJoinReq = dec(&req.payload)?;
-                encode(&app.join(req.conn_id).await)
+        Ok(Response::new(process(&self.app, request.into_inner()).await))
+    }
+
+    /// 双向流：持久连接上复用一条 h2 流处理所有请求。
+    async fn bridge_stream(
+        &self,
+        request: Request<tonic::Streaming<ForwardRequest>>,
+    ) -> Result<Response<Self::BridgeStreamStream>, Status> {
+        let mut rx = request.into_inner();
+        let (tx, out_rx) = tokio::sync::mpsc::channel::<Result<ForwardReply, Status>>(256);
+        let app = self.app.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.message().await {
+                    Ok(Some(req)) => {
+                        let reply = process(&app, req).await;
+                        if tx.send(Ok(reply)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
             }
-            msg::BATTLE_INPUT => {
-                let m: BattleInputReq = dec(&req.payload)?;
-                app.input(req.conn_id, m.dir_x, m.dir_y).await;
-                encode(&BattleInputResp {})
-            }
-            msg::BATTLE_LEAVE => {
-                app.leave(req.conn_id).await;
-                encode(&BattleLeaveResp {})
-            }
-            _ => return Err(Status::not_found(format!("unknown msg_id 0x{:X}", req.msg_id))),
-        };
-        Ok(Response::new(ForwardReply { payload }))
+        });
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(out_rx))))
     }
 
     async fn player_connected(
@@ -286,8 +334,8 @@ fn encode<T: prost::Message>(m: &T) -> Vec<u8> {
     buf
 }
 
-fn dec<T: prost::Message + Default>(b: &[u8]) -> Result<T, Status> {
-    grimoire_pb::pb::decode_message(b).map_err(|e| Status::invalid_argument(e.to_string()))
+fn dec<T: prost::Message + Default>(b: &[u8]) -> Result<T, prost::DecodeError> {
+    grimoire_pb::pb::decode_message(b)
 }
 
 #[tokio::main]

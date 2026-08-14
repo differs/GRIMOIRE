@@ -13,6 +13,7 @@ grimoire-net = { path = "../grimoire-net" }
 grimoire-common = { path = "../grimoire-common" }
 grimoire-svcfw = { path = "../grimoire-svcfw" }
 tokio.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
 bytes.workspace = true
 tracing.workspace = true

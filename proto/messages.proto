@@ -39,6 +39,9 @@ message KickReply { bool ok = 1; }
 service ServiceBridge {
   // 网关 -> 业务服务：转发客户端请求，返回响应 payload
   rpc HandleMessage(ForwardRequest) returns (ForwardReply);
+  // 网关 -> 业务服务：双向流式多路复用（高性能路径）。
+  // 一条持久流承载所有客户端请求/响应，避免每条消息一次 unary RPC 的 h2 流开销。
+  rpc BridgeStream(stream ForwardRequest) returns (stream ForwardReply);
   // 网关 -> 业务服务：连接建立事件（登录后）
   rpc PlayerConnected(PlayerEvent) returns (EventReply);
   // 网关 -> 业务服务：连接断开事件
@@ -51,7 +54,14 @@ message ForwardRequest {
   uint32 msg_id = 3;
   bytes payload = 4;
 }
-message ForwardReply { bytes payload = 1; }
+message ForwardReply {
+  uint32 conn_id = 1;
+  uint32 seq = 2;
+  uint32 msg_id = 3;
+  // 0=ok；非 0=错误（payload 为错误文本）
+  uint32 code = 4;
+  bytes payload = 5;
+}
 message PlayerEvent { uint32 conn_id = 1; }
 message EventReply { bool ok = 1; }
 

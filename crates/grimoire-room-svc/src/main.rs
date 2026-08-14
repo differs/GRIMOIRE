@@ -164,46 +164,55 @@ struct Bridge {
     app: Arc<App>,
 }
 
-#[tonic::async_trait]
-impl ServiceBridge for Bridge {
-    async fn handle_message(
-        &self,
-        request: Request<ForwardRequest>,
-    ) -> Result<Response<ForwardReply>, Status> {
-        let req = request.into_inner();
-        let app = &self.app;
-        debug!("room handle msg 0x{:X} from conn {}", req.msg_id, req.conn_id);
-        let payload = match req.msg_id {
-            msg::ROOM_LOGIN => {
-                let m: RoomLoginReq = dec(&req.payload)?;
-                encode(&app.login(req.conn_id, m.name))
-            }
-            msg::ROOM_CREATE => {
-                let m: RoomCreateReq = dec(&req.payload)?;
-                match app.create_room(req.conn_id, m.name, m.capacity) {
-                    Some(r) => encode(&r),
-                    None => err("已在房间中"),
-                }
-            }
-            msg::ROOM_JOIN => {
-                let m: RoomJoinReq = dec(&req.payload)?;
-                match app.join_room(req.conn_id, m.room_id) {
-                    Some(r) => {
-                        if let Some(room) = app.rooms.get(&m.room_id) {
-                            app.broadcast(&room, "join", req.conn_id).await;
-                        }
-                        encode(&r)
+/// 统一请求分发：unary 与流式共用，错误一律走 code=1 返回而非 gRPC Status。
+async fn process(app: &Arc<App>, req: ForwardRequest) -> ForwardReply {
+    debug!("room handle msg 0x{:X} from conn {}", req.msg_id, req.conn_id);
+    let reply = |payload: Vec<u8>| ForwardReply {
+        conn_id: req.conn_id,
+        seq: req.seq,
+        msg_id: req.msg_id,
+        code: 0,
+        payload,
+    };
+    let err = |text: String| ForwardReply {
+        conn_id: req.conn_id,
+        seq: req.seq,
+        msg_id: req.msg_id,
+        code: 1,
+        payload: text.into_bytes(),
+    };
+    match req.msg_id {
+        msg::ROOM_LOGIN => match dec::<RoomLoginReq>(&req.payload) {
+            Ok(m) => reply(encode(&app.login(req.conn_id, m.name))),
+            Err(e) => err(format!("bad payload: {e}")),
+        },
+        msg::ROOM_CREATE => match dec::<RoomCreateReq>(&req.payload) {
+            Ok(m) => match app.create_room(req.conn_id, m.name, m.capacity) {
+                Some(r) => reply(encode(&r)),
+                None => err("已在房间中".into()),
+            },
+            Err(e) => err(format!("bad payload: {e}")),
+        },
+        msg::ROOM_JOIN => match dec::<RoomJoinReq>(&req.payload) {
+            Ok(m) => match app.join_room(req.conn_id, m.room_id) {
+                Some(r) => {
+                    if let Some(room) = app.rooms.get(&m.room_id) {
+                        let room = room.clone();
+                        app.broadcast(&room, "join", req.conn_id).await;
                     }
-                    None => err("房间不存在或已满"),
+                    reply(encode(&r))
                 }
-            }
-            msg::ROOM_LEAVE => {
-                app.leave_room(req.conn_id);
-                encode(&RoomLeaveResp {})
-            }
-            msg::ROOM_LIST => encode(&app.list_rooms()),
-            msg::ROOM_CHAT => {
-                let m: grimoire_pb::pb::RoomChatReq = dec(&req.payload)?;
+                None => err("房间不存在或已满".into()),
+            },
+            Err(e) => err(format!("bad payload: {e}")),
+        },
+        msg::ROOM_LEAVE => {
+            app.leave_room(req.conn_id);
+            reply(encode(&RoomLeaveResp {}))
+        }
+        msg::ROOM_LIST => reply(encode(&app.list_rooms())),
+        msg::ROOM_CHAT => match dec::<grimoire_pb::pb::RoomChatReq>(&req.payload) {
+            Ok(m) => {
                 if let Some(p) = app.players.get(&req.conn_id) {
                     if p.room_id != 0 {
                         if let Some(room) = app.rooms.get(&p.room_id) {
@@ -220,11 +229,50 @@ impl ServiceBridge for Bridge {
                         }
                     }
                 }
-                encode(&grimoire_pb::pb::RoomChatResp {})
+                reply(encode(&grimoire_pb::pb::RoomChatResp {}))
             }
-            _ => return Err(Status::not_found(format!("unknown msg_id 0x{:X}", req.msg_id))),
-        };
-        Ok(Response::new(ForwardReply { payload }))
+            Err(e) => err(format!("bad payload: {e}")),
+        },
+        _ => err(format!("unknown msg_id 0x{:X}", req.msg_id)),
+    }
+}
+
+#[tonic::async_trait]
+impl ServiceBridge for Bridge {
+    type BridgeStreamStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<ForwardReply, tonic::Status>> + Send>,
+    >;
+
+    async fn handle_message(
+        &self,
+        request: Request<ForwardRequest>,
+    ) -> Result<Response<ForwardReply>, Status> {
+        Ok(Response::new(process(&self.app, request.into_inner()).await))
+    }
+
+    /// 双向流：持久连接上复用一条 h2 流处理所有请求。
+    async fn bridge_stream(
+        &self,
+        request: Request<tonic::Streaming<ForwardRequest>>,
+    ) -> Result<Response<Self::BridgeStreamStream>, Status> {
+        let mut rx = request.into_inner();
+        let (tx, out_rx) = tokio::sync::mpsc::channel::<Result<ForwardReply, Status>>(256);
+        let app = self.app.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.message().await {
+                    Ok(Some(req)) => {
+                        let reply = process(&app, req).await;
+                        if tx.send(Ok(reply)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(out_rx))))
     }
 
     async fn player_connected(
@@ -261,12 +309,8 @@ fn encode<T: prost::Message>(m: &T) -> Vec<u8> {
     buf
 }
 
-fn dec<T: prost::Message + Default>(b: &[u8]) -> Result<T, Status> {
-    grimoire_pb::pb::decode_message(b).map_err(|e| Status::invalid_argument(e.to_string()))
-}
-
-fn err(text: &str) -> Vec<u8> {
-    format!("err:{}", text).into_bytes()
+fn dec<T: prost::Message + Default>(b: &[u8]) -> Result<T, prost::DecodeError> {
+    grimoire_pb::pb::decode_message(b)
 }
 
 impl Room {

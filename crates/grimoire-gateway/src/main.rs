@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 mod discovery;
 mod session;
+mod stream;
 
 use session::Ctx;
 
@@ -91,10 +92,12 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let discovery = discovery::Discovery::new(args.registry.clone()).await?;
+    let streams = stream::Streams::new(discovery.clone());
     let (udp_tx, mut udp_rx) = tokio::sync::mpsc::channel::<(SocketAddr, Vec<u8>)>(512);
     let ctx = Arc::new(Ctx {
         sessions: Arc::new(DashMap::new()),
         discovery,
+        streams,
         next_conn_id: Default::default(),
         gateway_id: args.id,
         udp_tx,

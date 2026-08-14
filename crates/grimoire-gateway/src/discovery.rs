@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use grimoire_common::msg;
-use grimoire_pb::pb::{registry_service_client::RegistryServiceClient, NodeInfo};
+pub use grimoire_pb::pb::NodeInfo;
+use grimoire_pb::pb::registry_service_client::RegistryServiceClient;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
 use tracing::{debug, warn};

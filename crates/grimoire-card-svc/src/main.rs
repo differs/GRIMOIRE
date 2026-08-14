@@ -358,34 +358,80 @@ struct Bridge {
     app: Arc<App>,
 }
 
+/// 统一请求分发：unary 与流式共用，错误走 code=1。
+async fn process(app: &Arc<App>, req: ForwardRequest) -> ForwardReply {
+    debug!("card handle msg 0x{:X} from conn {}", req.msg_id, req.conn_id);
+    let reply = |payload: Vec<u8>| ForwardReply {
+        conn_id: req.conn_id,
+        seq: req.seq,
+        msg_id: req.msg_id,
+        code: 0,
+        payload,
+    };
+    let err = |text: String| ForwardReply {
+        conn_id: req.conn_id,
+        seq: req.seq,
+        msg_id: req.msg_id,
+        code: 1,
+        payload: text.into_bytes(),
+    };
+    match req.msg_id {
+        msg::CARD_START => match dec::<CardStartReq>(&req.payload) {
+            Ok(_) => reply(encode(&app.start(req.conn_id).await)),
+            Err(e) => err(format!("bad payload: {e}")),
+        },
+        msg::CARD_PLAY => match dec::<CardPlayReq>(&req.payload) {
+            Ok(m) => reply(encode(&app.play(req.conn_id, m.hand_index, m.target_player).await)),
+            Err(e) => err(format!("bad payload: {e}")),
+        },
+        msg::CARD_END_TURN => match dec::<CardEndTurnReq>(&req.payload) {
+            Ok(_) => reply(encode(&app.end_turn(req.conn_id).await)),
+            Err(e) => err(format!("bad payload: {e}")),
+        },
+        msg::CARD_STATE => match dec::<CardStateReq>(&req.payload) {
+            Ok(_) => reply(encode(&app.state(req.conn_id).await)),
+            Err(e) => err(format!("bad payload: {e}")),
+        },
+        _ => err(format!("unknown msg_id 0x{:X}", req.msg_id)),
+    }
+}
+
 #[tonic::async_trait]
 impl ServiceBridge for Bridge {
+    type BridgeStreamStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<ForwardReply, tonic::Status>> + Send>,
+    >;
+
     async fn handle_message(
         &self,
         request: Request<ForwardRequest>,
     ) -> Result<Response<ForwardReply>, Status> {
-        let req = request.into_inner();
-        let app = &self.app;
-        let payload = match req.msg_id {
-            msg::CARD_START => {
-                let _m: CardStartReq = dec(&req.payload)?;
-                encode(&app.start(req.conn_id).await)
+        Ok(Response::new(process(&self.app, request.into_inner()).await))
+    }
+
+    /// 双向流：持久连接上复用一条 h2 流处理所有请求。
+    async fn bridge_stream(
+        &self,
+        request: Request<tonic::Streaming<ForwardRequest>>,
+    ) -> Result<Response<Self::BridgeStreamStream>, Status> {
+        let mut rx = request.into_inner();
+        let (tx, out_rx) = tokio::sync::mpsc::channel::<Result<ForwardReply, Status>>(256);
+        let app = self.app.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.message().await {
+                    Ok(Some(req)) => {
+                        let reply = process(&app, req).await;
+                        if tx.send(Ok(reply)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
             }
-            msg::CARD_PLAY => {
-                let m: CardPlayReq = dec(&req.payload)?;
-                encode(&app.play(req.conn_id, m.hand_index, m.target_player).await)
-            }
-            msg::CARD_END_TURN => {
-                let _m: CardEndTurnReq = dec(&req.payload)?;
-                encode(&app.end_turn(req.conn_id).await)
-            }
-            msg::CARD_STATE => {
-                let _m: CardStateReq = dec(&req.payload)?;
-                encode(&app.state(req.conn_id).await)
-            }
-            _ => return Err(Status::not_found(format!("unknown msg_id 0x{:X}", req.msg_id))),
-        };
-        Ok(Response::new(ForwardReply { payload }))
+        });
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(out_rx))))
     }
 
     async fn player_connected(
@@ -414,8 +460,8 @@ fn encode<T: prost::Message>(m: &T) -> Vec<u8> {
     buf
 }
 
-fn dec<T: prost::Message + Default>(b: &[u8]) -> Result<T, Status> {
-    grimoire_pb::pb::decode_message(b).map_err(|e| Status::invalid_argument(e.to_string()))
+fn dec<T: prost::Message + Default>(b: &[u8]) -> Result<T, prost::DecodeError> {
+    grimoire_pb::pb::decode_message(b)
 }
 
 #[tokio::main]
