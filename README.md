@@ -194,3 +194,8 @@ DashMap 的 `get()/get_mut()/iter()` 返回的 `Ref` 持有分片**同步读锁*
 - 无持久化（可接 Postgres + Redis）
 - 无鉴权/TLS、网关无连接迁移（客户端掉线后重连可做到无缝重绑）
 - 正式项目应全异步化锁（当前用 `tokio::sync::Mutex`，可换无锁结构）
+
+
+## License
+
+[Apache License 2.0](LICENSE) © 2026 differs
