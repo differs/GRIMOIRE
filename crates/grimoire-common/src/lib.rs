@@ -10,6 +10,10 @@ pub mod msg {
     pub const DOMAIN_BATTLE: u32 = 0x0200_0000;
     pub const DOMAIN_CARD: u32 = 0x0300_0000;
 
+    /// 系统消息：连接建立后网关下发的"欢迎帧"，payload = conn_id(4B 大端)。
+    /// 客户端据此拿到全局连接号，用于 UDP 绑定等场景。
+    pub const SYS_CONN_ID: u32 = 0x0000_FFFF;
+
     pub fn domain_of(msg_id: u32) -> u32 {
         msg_id & DOMAIN_MASK
     }
@@ -45,4 +49,26 @@ pub mod svc {
     pub const ROOM: &str = "grimoire-room-svc";
     pub const BATTLE: &str = "grimoire-battle-svc";
     pub const CARD: &str = "grimoire-card-svc";
+}
+
+/// 全局连接号：高 8 位 = 网关 ID，低 24 位 = 网关内局部序号。
+/// 多活网关场景下，业务服务凭 conn_id 即可定位应由哪个网关下发推送。
+pub mod conn {
+    pub const GATEWAY_ID_SHIFT: u32 = 24;
+    pub const LOCAL_MASK: u32 = 0x00FF_FFFF;
+
+    #[inline]
+    pub fn make(gateway_id: u8, local: u32) -> u32 {
+        ((gateway_id as u32) << GATEWAY_ID_SHIFT) | (local & LOCAL_MASK)
+    }
+
+    #[inline]
+    pub fn gateway_id_of(conn_id: u32) -> u8 {
+        (conn_id >> GATEWAY_ID_SHIFT) as u8
+    }
+
+    #[inline]
+    pub fn local_of(conn_id: u32) -> u32 {
+        conn_id & LOCAL_MASK
+    }
 }

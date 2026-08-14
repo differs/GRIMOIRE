@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
 use dashmap::DashMap;
-use grimoire_net::{Frame, PType};
+use grimoire_net::{udp, Frame, PType};
 use grimoire_pb::pb::{
     gateway_service_server::{GatewayService, GatewayServiceServer},
     KickReply, KickRequest, PushReply, PushRequest,
@@ -14,17 +16,22 @@ use tracing_subscriber::EnvFilter;
 mod discovery;
 mod session;
 
-use discovery::Discovery;
-use session::{Ctx, Session};
+use session::Ctx;
 
 #[derive(Parser)]
 struct Args {
+    /// 网关 ID（高 8 位编码进 conn_id，多活实例须唯一）
+    #[arg(long, default_value = "1")]
+    id: u8,
     /// 客户端 TCP 接入端口
     #[arg(long, default_value = "127.0.0.1:9000")]
     client_listen: String,
     /// 业务服务 push/kick 的 gRPC 端口
     #[arg(long, default_value = "127.0.0.1:9100")]
     grpc_listen: String,
+    /// 实时对战 UDP 端口
+    #[arg(long, default_value = "127.0.0.1:9020")]
+    udp_listen: String,
     /// 注册中心地址
     #[arg(long, default_value = "127.0.0.1:8500")]
     registry: String,
@@ -32,23 +39,17 @@ struct Args {
 
 /// gRPC 侧：业务服务主动 push/kick 到客户端连接
 struct GatewayGrpc {
-    sessions: Arc<DashMap<u32, Arc<Session>>>,
+    ctx: Arc<Ctx>,
 }
 
 #[tonic::async_trait]
 impl GatewayService for GatewayGrpc {
     async fn push(&self, request: Request<PushRequest>) -> Result<Response<PushReply>, Status> {
         let req = request.into_inner();
-        let ok = match self.sessions.get(&req.conn_id) {
+        let ok = match self.ctx.sessions.get(&req.conn_id) {
             Some(s) => {
-                debug!("push conn {} msg 0x{:X}", req.conn_id, req.msg_id);
-                s.send(Frame {
-                    ptype: PType::Push,
-                    msg_id: req.msg_id,
-                    seq: 0,
-                    payload: req.payload.into(),
-                })
-                .await
+                debug!("push conn {} msg 0x{:X} udp={}", req.conn_id, req.msg_id, req.udp);
+                s.push_msg(&self.ctx, req.msg_id, req.payload.into(), req.udp).await
             }
             None => {
                 warn!("push conn {} not found", req.conn_id);
@@ -63,7 +64,7 @@ impl GatewayService for GatewayGrpc {
 
     async fn kick(&self, request: Request<KickRequest>) -> Result<Response<KickReply>, Status> {
         let req = request.into_inner();
-        let ok = match self.sessions.remove(&req.conn_id) {
+        let ok = match self.ctx.sessions.remove(&req.conn_id) {
             Some((_, s)) => {
                 let _ = s
                     .send(Frame {
@@ -84,22 +85,34 @@ impl GatewayService for GatewayGrpc {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
 
-    let discovery = Discovery::new(args.registry.clone()).await?;
+    let discovery = discovery::Discovery::new(args.registry.clone()).await?;
+    let (udp_tx, mut udp_rx) = tokio::sync::mpsc::channel::<(SocketAddr, Vec<u8>)>(512);
     let ctx = Arc::new(Ctx {
         sessions: Arc::new(DashMap::new()),
         discovery,
         next_conn_id: Default::default(),
+        gateway_id: args.id,
+        udp_tx,
     });
+
+    // 注册到注册中心（多活网关按 id 区分）
+    grimoire_svcfw::register_and_heartbeat(
+        &args.registry,
+        grimoire_common::svc::GATEWAY,
+        &format!("gw-{}", args.id),
+        &args.grpc_listen,
+        HashMap::from([("id".to_string(), args.id.to_string())]),
+        10,
+    )
+    .await?;
 
     // TCP 客户端接入
     let listener = tokio::net::TcpListener::bind(&args.client_listen).await?;
-    info!("gateway client tcp listening on {}", args.client_listen);
+    info!("gateway {} tcp listening on {}", args.id, args.client_listen);
 
     let ctx_tcp = ctx.clone();
     tokio::spawn(async move {
@@ -114,9 +127,40 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 业务服务桥接 gRPC（与 TCP 接入共享同一 sessions 表）
-    let grpc = GatewayGrpc { sessions: ctx.sessions.clone() };
-    info!("gateway grpc listening on {}", args.grpc_listen);
+    // UDP 实时对战通道
+    let udp_sock = Arc::new(tokio::net::UdpSocket::bind(&args.udp_listen).await?);
+    info!("gateway {} udp listening on {}", args.id, args.udp_listen);
+    {
+        let sock = udp_sock.clone();
+        let c = ctx.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; udp::MAX_DATAGRAM];
+            loop {
+                match sock.recv_from(&mut buf).await {
+                    Ok((n, src)) => {
+                        let c = c.clone();
+                        let data = buf[..n].to_vec();
+                        tokio::spawn(session::handle_udp_datagram(c, src, data));
+                    }
+                    Err(e) => warn!("udp recv error: {}", e),
+                }
+            }
+        });
+    }
+    {
+        let sock = udp_sock.clone();
+        tokio::spawn(async move {
+            while let Some((addr, dgram)) = udp_rx.recv().await {
+                if let Err(e) = sock.send_to(&dgram, addr).await {
+                    warn!("udp send to {} error: {}", addr, e);
+                }
+            }
+        });
+    }
+
+    // 业务服务桥接 gRPC
+    let grpc = GatewayGrpc { ctx };
+    info!("gateway {} grpc listening on {}", args.id, args.grpc_listen);
     tonic::transport::Server::builder()
         .add_service(GatewayServiceServer::new(grpc))
         .serve(args.grpc_listen.parse()?)

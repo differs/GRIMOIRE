@@ -8,8 +8,9 @@ use anyhow::Context;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use grimoire_net::{Frame, FrameCodec, PType};
-use tokio::net::TcpStream;
+use grimoire_common::msg;
+use grimoire_net::{udp, Frame, FrameCodec, PType};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -19,6 +20,8 @@ pub struct Client {
     seq: AtomicU32,
     pub pushes: broadcast::Receiver<Frame>,
     conn_id_label: u32,
+    /// 网关欢迎帧下发的全局连接号
+    conn_id: Arc<AtomicU32>,
 }
 
 impl Client {
@@ -39,6 +42,8 @@ impl Client {
         let responses: Arc<DashMap<u32, oneshot::Sender<Frame>>> = Arc::new(DashMap::new());
         let (push_tx, pushes) = broadcast::channel(128);
         let resp_map = responses.clone();
+        let conn_id = Arc::new(AtomicU32::new(0));
+        let conn_id_w = conn_id.clone();
         tokio::spawn(async move {
             let mut r = FramedRead::new(read_half, FrameCodec);
             while let Some(item) = r.next().await {
@@ -50,7 +55,12 @@ impl Client {
                             }
                         }
                         PType::Push => {
-                            let _ = push_tx.send(f);
+                            if f.msg_id == msg::SYS_CONN_ID && f.payload.len() == 4 {
+                                let cid = u32::from_be_bytes([f.payload[0], f.payload[1], f.payload[2], f.payload[3]]);
+                                conn_id_w.store(cid, Ordering::Relaxed);
+                            } else {
+                                let _ = push_tx.send(f);
+                            }
                         }
                         PType::Heartbeat => {}
                         PType::Close => break,
@@ -64,7 +74,19 @@ impl Client {
             }
         });
 
-        Ok(Self { tx, responses, seq: AtomicU32::new(1), pushes, conn_id_label })
+        Ok(Self {
+            tx,
+            responses,
+            seq: AtomicU32::new(1),
+            pushes,
+            conn_id_label,
+            conn_id,
+        })
+    }
+
+    /// 全局连接号（网关下发）。连接建立后很快可用。
+    pub fn conn_id(&self) -> u32 {
+        self.conn_id.load(Ordering::Relaxed)
     }
 
     /// 发送请求并等待对应响应（5s 超时）。
@@ -110,7 +132,40 @@ impl Clone for Client {
             seq: AtomicU32::new(self.seq.load(Ordering::Relaxed)),
             pushes: self.pushes.resubscribe(),
             conn_id_label: self.conn_id_label,
+            conn_id: self.conn_id.clone(),
         }
+    }
+}
+
+/// UDP 实时对战通道：绑定 conn_id、发送输入、接收帧同步。
+#[derive(Clone)]
+pub struct UdpBattle {
+    sock: Arc<UdpSocket>,
+    conn_id: u32,
+}
+
+impl UdpBattle {
+    /// 绑定到网关 UDP 端口，并发送首包建立会话绑定。
+    pub async fn bind(gateway_udp: &str, conn_id: u32) -> anyhow::Result<Self> {
+        let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        sock.connect(gateway_udp).await.context("udp connect")?;
+        let pkt = udp::peer_packet(conn_id, msg::BATTLE_INPUT, &[]);
+        sock.send(&pkt).await.context("udp bind packet")?;
+        Ok(Self { sock, conn_id })
+    }
+
+    pub async fn send_input(&self, dir_x: f32, dir_y: f32) -> anyhow::Result<()> {
+        let payload = grimoire_pb::pb::encode_message(&grimoire_pb::pb::BattleInputReq { dir_x, dir_y });
+        let pkt = udp::peer_packet(self.conn_id, msg::BATTLE_INPUT, &payload);
+        self.sock.send(&pkt).await?;
+        Ok(())
+    }
+
+    /// 接收一条网关推送数据报。
+    pub async fn recv_push(&self) -> anyhow::Result<Option<(u32, u32, Bytes)>> {
+        let mut buf = vec![0u8; udp::MAX_DATAGRAM];
+        let n = self.sock.recv(&mut buf).await?;
+        Ok(udp::parse_push_datagram(&buf[..n]))
     }
 }
 

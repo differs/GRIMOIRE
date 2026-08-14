@@ -8,11 +8,13 @@
 ```
 客户端 / 压测 sim (grimoire-sim)
    │  TCP 长连接 + 自定义帧协议 (protobuf payload)
+   │  UDP 低延迟通道（实时对战帧同步）
    ▼
-[gateway 网关]            ←→  连接管理 / 帧解析 / 按 msg_id 玩法域路由
+[gateway 网关 × N]        ←→  连接管理 / 帧解析 / 按 msg_id 玩法域路由 / push-kick
    │  gRPC (tonic)
    ▼
-[registry 注册中心]       ←→  服务注册 / 心跳续约 / TTL 过期 / 发现（自研，etcd 语义）
+[registry 注册中心]       ←→  服务注册 / 心跳续约 / 租约过期 / 前缀发现
+   │  后端可选：etcd（推荐）或内存
    │
    ├── room-svc    MMO 大厅/房间制
    ├── battle-svc  实时对战（帧同步）
@@ -24,14 +26,23 @@
 - `ptype`: 0=request 1=response 2=push 3=heartbeat 4=close
 - gateway **只按玩法域路由**，域内分发由各业务服务自己处理 → 新增玩法只需注册新域
 
+## 核心特性
+
+1. **多活网关**：`conn_id` 高 8 位编码网关 ID；网关自注册到注册中心，业务服务凭 `conn_id` 定位并推送到对应网关。多实例网关各自独立接入，客户端可分散到不同网关（跨网关对局正常）。
+2. **etcd 注册中心**：注册中心后端可切 etcd——注册=租约+写 key、心跳=keep_alive 续约、发现=前缀 Range。**进程失联时 etcd 租约自动过期删 key**（无需本地扫描器），接口与内存版完全一致。
+3. **UDP 帧同步**：实时对战走 UDP 低延迟通道——客户端 UDP 包首包绑定 `conn_id`，输入经 UDP 上行，帧同步经 UDP 下行；未绑定 UDP 时网关自动回退 TCP。
+
 ## 快速开始
 
 ```bash
 cargo build --release          # 编译
-bash scripts/run-all.sh        # 启动 registry/gateway/三个服务
-./target/release/grimoire-sim --mode room     # MMO 房间制 demo
-./target/release/grimoire-sim --mode battle   # 实时对战帧同步 demo
-./target/release/grimoire-sim --mode card     # 卡牌回合制 demo
+bash scripts/start-etcd.sh     # 启动 etcd（推荐后端）
+bash scripts/run-multi.sh      # 启动 registry(etcd)/双网关/三个服务
+# 测试（A 走 gw1、B 走 gw2 的跨网关对局）
+./target/release/grimoire-sim --mode room       --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001
+./target/release/grimoire-sim --mode battle     --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001
+./target/release/grimoire-sim --mode battle-udp --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001 --udp-gateway 127.0.0.1:9020
+./target/release/grimoire-sim --mode card       --gateway 127.0.0.1:9000 --gateway-b 127.0.0.1:9001
 ./target/release/grimoire-sim --mode bench --clients 200 --duration 5   # 压测
 bash scripts/stop-all.sh
 ```
@@ -56,23 +67,27 @@ bash scripts/stop-all.sh
 
 ```
 crates/
-├── net/       # TCP 帧编解码（粘包拆包、心跳）
-├── pb/        # protobuf + gRPC 生成代码（prost/tonic，vendored protoc）
-├── common/    # msg_id 分配表、服务名常量
-├── svcfw/     # 服务框架：注册/心跳、gateway push 客户端
-├── registry/  # 注册中心（内存实现：注册/心跳/TTL/发现）
-├── gateway/   # 网关（TCP 接入 + 业务桥接 gRPC + push/kick）
-├── room-svc/  # MMO 大厅/房间制
-├── battle-svc # 实时对战帧同步
-├── card-svc/  # 卡牌回合制
-└── sim/       # 测试/压测客户端
+├── net/          # TCP 帧编解码 + UDP 数据报格式（粘包拆包、心跳）
+├── pb/           # protobuf + gRPC 生成代码（prost/tonic，vendored protoc）
+├── common/       # msg_id 分配表、服务名常量、全局 conn_id 编码
+├── svcfw/        # 服务框架：注册/心跳、按网关发现的 push 客户端
+├── registry/     # 注册中心（etcd 后端 + 内存后端双实现）
+├── gateway/      # 多活网关（TCP 接入 + UDP 通道 + 业务桥接 gRPC + push/kick）
+├── room-svc/     # MMO 大厅/房间制
+├── battle-svc/   # 实时对战帧同步（UDP 广播）
+├── card-svc/     # 卡牌回合制
+└── sim/          # 测试/压测客户端（room/battle/battle-udp/card/bench）
 ```
 
 ## 各玩法实现要点
 
-- **room-svc**：`DashMap` 存玩家/房间；登录→建房→入房→聊天全程 push 广播；`PlayerDisconnected` 自动离房清人。注意 DashMap 的 `get()` Ref 未释放就 `get_mut()` 会自死锁。
-- **battle-svc**：`tokio::time::interval(50ms)` 全局模拟节拍；每帧按玩家最近输入做确定性位移模拟，向战斗内所有连接广播同一份 `FrameSyncPush`。客户端看到的第 N 帧与所有人完全一致。
-- **card-svc**：`phase + turn` 状态机；出牌/结束回合全部服务端校验（回合、手牌序号、目标合法性）；快照按接收者视角裁剪（自己见手牌明细、对手只见数量）。
+- **room-svc**：`DashMap` 存玩家/房间；登录→建房→入房→聊天全程 push 广播；`PlayerDisconnected` 自动离房清人。
+- **battle-svc**：`tokio::time::interval(50ms)` 全局模拟节拍；每帧按玩家最近输入做确定性位移模拟，向战斗内所有连接广播同一份 `FrameSyncPush`（UDP）。客户端看到的第 N 帧与所有人完全一致。
+- **card-svc**：`phase + turn` 状态机；出牌/结束回合全部服务端校验；快照按接收者视角裁剪（自己见手牌明细、对手只见数量）。
+
+## 踩坑记录（DashMap 自死锁）
+
+DashMap 的 `get()/get_mut()/iter()` 返回的 `Ref` 持有分片**同步读锁**，若在 Ref 存活期间再对同一分片调 `remove()/get_mut()` 请求**写锁**，parking_lot 写优先会让该线程自死锁——且因为它是同步锁，会**阻塞整个 tokio worker 线程**，连锁把定时器/心跳全部卡死。修复模式：先 `drop` 释放 Ref 再写。
 
 ## 压测对比
 
@@ -84,8 +99,7 @@ crates/
 
 ## 已知简化 & 后续路线
 
-- 注册中心为单节点内存版（接口对齐 etcd，可替换为真实 etcd）
-- 实时对战未做 UDP/KCP、延迟补偿、快照回放（可参考 `battle-svc` 继续扩展）
-- 无持久化（可接 Postgres + Redis，`docker-compose` 已预留）
-- 无鉴权/TLS/网关集群化
-- 正式项目应全异步化锁（当前 demo 对房间/战斗用了 await 锁，可换无锁结构）
+- 实时对战未做 KCP、延迟补偿、快照回放（已走通 UDP 通道，可继续扩展）
+- 无持久化（可接 Postgres + Redis）
+- 无鉴权/TLS、网关无连接迁移（客户端掉线后重连可做到无缝重绑）
+- 正式项目应全异步化锁（当前用 `tokio::sync::Mutex`，可换无锁结构）

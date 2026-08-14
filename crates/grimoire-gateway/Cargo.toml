@@ -11,6 +11,7 @@ path = "src/main.rs"
 grimoire-pb = { path = "../grimoire-pb" }
 grimoire-net = { path = "../grimoire-net" }
 grimoire-common = { path = "../grimoire-common" }
+grimoire-svcfw = { path = "../grimoire-svcfw" }
 tokio.workspace = true
 tonic.workspace = true
 bytes.workspace = true

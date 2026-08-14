@@ -1,10 +1,11 @@
 //! 测试/压测客户端。
 //!
 //! 模式：
-//!   room    —— MMO 大厅/房间制全流程 demo（两客户端互动作业）
-//!   battle  —— 实时对战帧同步 demo（两客户端入局，观察 20Hz 快照广播）
-//!   card    —— 卡牌回合制 demo（两客户端对局，演示权威校验与视角裁剪）
-//!   bench   —— 压测：N 连接并发发请求，统计 QPS 与延迟分位
+//!   room       —— MMO 大厅/房间制全流程 demo（两客户端互动作业）
+//!   battle     —— 实时对战帧同步 demo（两客户端入局，观察 20Hz 快照广播）
+//!   battle-udp —— 实时对战 UDP 通道 demo（输入与帧同步都走 UDP）
+//!   card       —— 卡牌回合制 demo（两客户端对局，演示权威校验与视角裁剪）
+//!   bench      —— 压测：N 连接并发发请求，统计 QPS 与延迟分位
 
 mod client;
 
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
-use client::{dec, enc, Client};
+use client::{dec, enc, Client, UdpBattle};
 use grimoire_common::msg;
 use grimoire_pb::pb::*;
 use tokio::sync::mpsc;
@@ -20,8 +21,15 @@ use tracing::info;
 
 #[derive(Parser)]
 struct Args {
+    /// 客户端 A 连接的网关
     #[arg(long, default_value = "127.0.0.1:9000")]
     gateway: String,
+    /// 客户端 B 连接的网关（多活网关演示时指向另一实例）
+    #[arg(long, default_value = "127.0.0.1:9000")]
+    gateway_b: String,
+    /// 客户端 A 所在网关的 UDP 端口（battle-udp 用）
+    #[arg(long, default_value = "127.0.0.1:9020")]
+    udp_gateway: String,
     #[arg(long, default_value = "room")]
     mode: String,
     /// bench 模式：并发连接数
@@ -43,6 +51,7 @@ async fn main() -> Result<()> {
     match args.mode.as_str() {
         "room" => room_demo(&args).await?,
         "battle" => battle_demo(&args).await?,
+        "battle-udp" => battle_udp_demo(&args).await?,
         "card" => card_demo(&args).await?,
         "bench" => bench(&args).await?,
         other => anyhow::bail!("unknown mode: {other}"),
@@ -111,7 +120,7 @@ async fn room_demo(args: &Args) -> Result<()> {
     info!("=== room demo ===");
     let a = Client::connect(&args.gateway, 1).await?;
     a.start_heartbeat();
-    let b = Client::connect(&args.gateway, 2).await?;
+    let b = Client::connect(&args.gateway_b, 2).await?;
     b.start_heartbeat();
     // 提前订阅 push，与交互流程并行打印
     let (pa, pb) = (a.clone(), b.clone());
@@ -149,7 +158,7 @@ async fn battle_demo(args: &Args) -> Result<()> {
     info!("=== battle demo ===");
     let a = Client::connect(&args.gateway, 1).await?;
     a.start_heartbeat();
-    let b = Client::connect(&args.gateway, 2).await?;
+    let b = Client::connect(&args.gateway_b, 2).await?;
     b.start_heartbeat();
 
     let r = a.request(msg::BATTLE_JOIN, vec![]).await?;
@@ -178,11 +187,86 @@ async fn battle_demo(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// 实时对战 UDP 通道：TCP 入局拿身份，UDP 发输入 + 收帧同步。
+async fn battle_udp_demo(args: &Args) -> Result<()> {
+    info!("=== battle-udp demo ===");
+    let a = Client::connect(&args.gateway, 1).await?;
+    a.start_heartbeat();
+    let b = Client::connect(&args.gateway_b, 2).await?;
+    b.start_heartbeat();
+    let (pa, pb) = (a.clone(), b.clone());
+    let printer = tokio::spawn(async move {
+        tokio::join!(wait_pushes(&pa, "A(tcp-fallback)", 5), wait_pushes(&pb, "B(tcp-fallback)", 5));
+    });
+
+    let r = a.request(msg::BATTLE_JOIN, vec![]).await?;
+    let ja = dec::<BattleJoinResp>(&r.payload)?;
+    let r = b.request(msg::BATTLE_JOIN, vec![]).await?;
+    let jb = dec::<BattleJoinResp>(&r.payload)?;
+    info!("A player {} joined battle#{}, B player {} joined ({}Hz)",
+        ja.player_id, ja.battle_id, jb.player_id, ja.frame_rate);
+
+    // 等欢迎帧拿到 conn_id，建立 UDP 通道
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let a_cid = a.conn_id();
+    let b_cid = b.conn_id();
+    info!("conn_id A={} B={} (网关ID A={} B={})", a_cid, b_cid,
+        grimoire_common::conn::gateway_id_of(a_cid), grimoire_common::conn::gateway_id_of(b_cid));
+    let ua = UdpBattle::bind(&args.udp_gateway, a_cid).await?;
+    let ub = UdpBattle::bind(&args.udp_gateway, b_cid).await?;
+    info!("UDP 通道绑定完成");
+
+    // A 持续通过 UDP 发输入
+    let ua_send = ua.clone();
+    let ua2 = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        let mut t = 0.0_f32;
+        loop {
+            tick.tick().await;
+            t += 0.3;
+            let _ = ua_send.send_input(t.cos(), t.sin()).await;
+        }
+    });
+
+    // 两端收 UDP 帧同步
+    let deadline = tokio::time::sleep(Duration::from_secs(4));
+    tokio::pin!(deadline);
+    let mut fa = 0u64;
+    let mut fb = 0u64;
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            r = ua.recv_push() => {
+                if let Ok(Some((_, _, payload))) = r {
+                    if let Ok(p) = dec::<FrameSyncPush>(&payload) {
+                        if p.frame != fa { fa = p.frame; info!("[UDP A] frame#{}: {}", p.frame, fmt_battle(&p.players)); }
+                    }
+                }
+            }
+            r = ub.recv_push() => {
+                if let Ok(Some((_, _, payload))) = r {
+                    if let Ok(p) = dec::<FrameSyncPush>(&payload) {
+                        if p.frame != fb { fb = p.frame; info!("[UDP B] frame#{}: {}", p.frame, fmt_battle(&p.players)); }
+                    }
+                }
+            }
+        }
+    }
+    ua2.abort();
+    printer.abort();
+    info!("=== battle-udp demo done ===");
+    Ok(())
+}
+
+fn fmt_battle(players: &[BattlePlayer]) -> String {
+    players.iter().map(|p| format!("P{}@({:.0},{:.0})", p.player_id, p.x, p.y)).collect::<Vec<_>>().join(" ")
+}
+
 async fn card_demo(args: &Args) -> Result<()> {
     info!("=== card demo ===");
     let a = Client::connect(&args.gateway, 1).await?;
     a.start_heartbeat();
-    let b = Client::connect(&args.gateway, 2).await?;
+    let b = Client::connect(&args.gateway_b, 2).await?;
     b.start_heartbeat();
     let (pa, pb) = (a.clone(), b.clone());
     let printer = tokio::spawn(async move {

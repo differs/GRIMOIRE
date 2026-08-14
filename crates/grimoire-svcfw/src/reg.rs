@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use grimoire_pb::pb::{registry_service_client::RegistryServiceClient, RegisterRequest};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// 注册到注册中心并启动心跳协程。返回后即完成注册，心跳持续到进程退出。
 pub async fn register_and_heartbeat(
@@ -43,15 +43,19 @@ pub async fn register_and_heartbeat(
         let mut tick = tokio::time::interval(period);
         loop {
             tick.tick().await;
-            match client
-                .heartbeat(grimoire_pb::pb::HeartbeatRequest {
+            match tokio::time::timeout(
+                Duration::from_secs(period.as_secs()),
+                client.heartbeat(grimoire_pb::pb::HeartbeatRequest {
                     service: svc_owned.clone(),
                     node_id: node_owned.clone(),
-                })
-                .await
+                }),
+            )
+            .await
             {
-                Ok(r) => {
-                    if !r.into_inner().ok {
+                Ok(Ok(r)) => {
+                    let ok = r.into_inner().ok;
+                    debug!("heartbeat {} {} sent -> ok={}", svc_owned, node_owned, ok);
+                    if !ok {
                         warn!("{} {} heartbeat rejected, re-registering", svc_owned, node_owned);
                         let _ = client
                             .register(RegisterRequest {
@@ -64,7 +68,8 @@ pub async fn register_and_heartbeat(
                             .await;
                     }
                 }
-                Err(e) => warn!("heartbeat {} {} failed: {}", svc_owned, node_owned, e),
+                Ok(Err(e)) => warn!("heartbeat {} {} failed: {}", svc_owned, node_owned, e),
+                Err(_) => warn!("heartbeat {} {} TIMEOUT (stalled)", svc_owned, node_owned),
             }
         }
     });

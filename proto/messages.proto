@@ -25,6 +25,8 @@ message PushRequest {
   uint32 conn_id = 1;
   uint32 msg_id = 2;
   bytes payload = 3;
+  // true 表示希望走 UDP 低延迟通道（实时对战用）；未绑定 UDP 时网关回退 TCP
+  bool udp = 4;
 }
 message PushReply { bool ok = 1; }
 message KickRequest {

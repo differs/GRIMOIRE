@@ -49,8 +49,6 @@ struct Args {
     listen: String,
     #[arg(long, default_value = "127.0.0.1:8500")]
     registry: String,
-    #[arg(long, default_value = "127.0.0.1:9100")]
-    gateway: String,
     #[arg(long, default_value = "card-svc-1")]
     node_id: String,
 }
@@ -335,8 +333,11 @@ impl App {
         if let Some(g) = self.games.get(&gid) {
             let mut game = g.value().lock().await;
             game.players.remove(idx);
-            if game.players.is_empty() {
+            let empty = game.players.is_empty();
+            if empty {
+                // 先释放 Ref（读锁）再 remove（写锁），避免分片自死锁
                 drop(game);
+                drop(g);
                 self.games.remove(&gid);
             } else if game.phase == PHASE_PLAYING {
                 // 对手退场 → 直接判胜
@@ -423,7 +424,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
-    let pusher = Pusher::connect(&args.gateway).await?;
+    let pusher = Pusher::connect(&args.registry).await?;
     let app = Arc::new(App::new(pusher));
 
     grimoire_svcfw::register_and_heartbeat(

@@ -29,8 +29,6 @@ struct Args {
     listen: String,
     #[arg(long, default_value = "127.0.0.1:8500")]
     registry: String,
-    #[arg(long, default_value = "127.0.0.1:9100")]
-    gateway: String,
     #[arg(long, default_value = "room-svc-1")]
     node_id: String,
 }
@@ -293,7 +291,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
-    let pusher = Pusher::connect(&args.gateway).await?;
+    let pusher = Pusher::connect(&args.registry).await?;
     let app = Arc::new(App::new(pusher));
 
     grimoire_svcfw::register_and_heartbeat(

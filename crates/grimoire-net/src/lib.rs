@@ -115,3 +115,56 @@ pub enum FrameError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
+
+/// UDP 数据报格式（实时对战低延迟通道）。
+///
+/// 客户端 -> 网关（绑定 + 上行输入）：
+///   [magic 2 'MU'][conn_id 4][msg_id 4][payload]
+/// 网关 -> 客户端（服务端推送）：
+///   [magic 2 'MU'][msg_id 4][seq 4][payload]
+/// UDP 无粘包问题，一个数据报即一条消息；不做可靠重传，天然"最新状态优先"。
+pub mod udp {
+    use bytes::{BufMut, Bytes, BytesMut};
+
+    pub const MAGIC: &[u8; 2] = b"MU";
+    pub const HEADER_LEN: usize = 10;
+    pub const MAX_DATAGRAM: usize = 2048;
+
+    /// 客户端->网关：绑定/输入包
+    pub fn peer_packet(conn_id: u32, msg_id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut b = BytesMut::with_capacity(HEADER_LEN + payload.len());
+        b.put_slice(MAGIC);
+        b.put_u32(conn_id);
+        b.put_u32(msg_id);
+        b.extend_from_slice(payload);
+        b.to_vec()
+    }
+
+    pub fn parse_peer_packet(d: &[u8]) -> Option<(u32, u32, &[u8])> {
+        if d.len() < HEADER_LEN || &d[0..2] != MAGIC {
+            return None;
+        }
+        let conn_id = u32::from_be_bytes([d[2], d[3], d[4], d[5]]);
+        let msg_id = u32::from_be_bytes([d[6], d[7], d[8], d[9]]);
+        Some((conn_id, msg_id, &d[HEADER_LEN..]))
+    }
+
+    /// 网关->客户端：推送包
+    pub fn push_datagram(msg_id: u32, seq: u32, payload: Bytes) -> Vec<u8> {
+        let mut b = BytesMut::with_capacity(HEADER_LEN + payload.len());
+        b.put_slice(MAGIC);
+        b.put_u32(msg_id);
+        b.put_u32(seq);
+        b.extend_from_slice(&payload);
+        b.to_vec()
+    }
+
+    pub fn parse_push_datagram(d: &[u8]) -> Option<(u32, u32, Bytes)> {
+        if d.len() < HEADER_LEN || &d[0..2] != MAGIC {
+            return None;
+        }
+        let msg_id = u32::from_be_bytes([d[2], d[3], d[4], d[5]]);
+        let seq = u32::from_be_bytes([d[6], d[7], d[8], d[9]]);
+        Some((msg_id, seq, Bytes::copy_from_slice(&d[HEADER_LEN..])))
+    }
+}

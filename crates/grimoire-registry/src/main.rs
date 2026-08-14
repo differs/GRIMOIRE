@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,154 +7,127 @@ use grimoire_pb::pb::{
     DiscoverReply, DiscoverRequest, HeartbeatReply, HeartbeatRequest, NodeInfo, RegisterReply,
     RegisterRequest, UnregisterReply, UnregisterRequest,
 };
-use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info};
+
+mod etcd_backend;
+mod memory_backend;
+
+use etcd_backend::EtcdBackend;
+use memory_backend::SharedMemory;
 
 #[derive(Parser)]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:8500")]
     listen: String,
+    /// etcd 地址列表，逗号分隔。缺省则使用内存后端。
+    #[arg(long, default_value = "")]
+    registry: String,
 }
 
 #[derive(Clone)]
-struct NodeRecord {
-    addr: String,
-    meta: HashMap<String, String>,
-    /// 绝对过期时刻（纳秒），续约即重置
-    expires_at: u128,
+enum Backend {
+    Memory(SharedMemory),
+    Etcd(Arc<EtcdBackend>),
 }
-
-impl NodeRecord {
-    fn new(addr: String, meta: HashMap<String, String>, ttl_secs: i32) -> Self {
-        Self {
-            addr,
-            meta,
-            expires_at: now_ns() + (ttl_secs.max(1) as u128) * 1_000_000_000,
-        }
-    }
-    fn refresh(&mut self, ttl_secs: i32) {
-        self.expires_at = now_ns() + (ttl_secs.max(1) as u128) * 1_000_000_000;
-    }
-}
-
-fn now_ns() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-}
-
-/// 注册中心：内存实现，服务名 -> (node_id -> NodeRecord)
-struct RegistryState {
-    services: HashMap<String, HashMap<String, NodeRecord>>,
-}
-
-type Shared = Arc<Mutex<RegistryState>>;
 
 #[derive(Clone)]
 struct RegistrySvc {
-    state: Shared,
+    backend: Backend,
     default_ttl: i32,
 }
 
 #[tonic::async_trait]
 impl RegistryService for RegistrySvc {
-    async fn register(
-        &self,
-        request: Request<RegisterRequest>,
-    ) -> Result<Response<RegisterReply>, Status> {
+    async fn register(&self, request: Request<RegisterRequest>) -> Result<Response<RegisterReply>, Status> {
         let req = request.into_inner();
-        let mut st = self.state.lock().await;
         let ttl = if req.ttl_secs > 0 { req.ttl_secs } else { self.default_ttl };
-        st.services
-            .entry(req.service.clone())
-            .or_default()
-            .insert(req.node_id.clone(), NodeRecord::new(req.addr.clone(), req.meta.clone(), ttl));
-        info!("registered {} {}", req.service, req.node_id);
+        match &self.backend {
+            Backend::Memory(st) => {
+                st.lock().await.insert(&req.service, &req.node_id, req.addr, req.meta, ttl);
+                info!("registered {} {}", req.service, req.node_id);
+            }
+            Backend::Etcd(e) => {
+                e.register(&req.service, &req.node_id, &req.addr, req.meta, ttl)
+                    .await
+                    .map_err(|err| Status::internal(format!("etcd register: {err}")))?;
+            }
+        }
         Ok(Response::new(RegisterReply { ok: true }))
     }
 
-    async fn heartbeat(
-        &self,
-        request: Request<HeartbeatRequest>,
-    ) -> Result<Response<HeartbeatReply>, Status> {
+    async fn heartbeat(&self, request: Request<HeartbeatRequest>) -> Result<Response<HeartbeatReply>, Status> {
         let req = request.into_inner();
-        let mut st = self.state.lock().await;
-        if let Some(node) = st.services.get_mut(&req.service).and_then(|m| m.get_mut(&req.node_id)) {
-            node.refresh(self.default_ttl);
-            Ok(Response::new(HeartbeatReply { ok: true }))
-        } else {
-            Ok(Response::new(HeartbeatReply { ok: false }))
+        let ok = match &self.backend {
+            Backend::Memory(st) => {
+                let mut st = st.lock().await;
+                st.heartbeat(&req.service, &req.node_id, self.default_ttl)
+            }
+            Backend::Etcd(e) => e.heartbeat(&req.service, &req.node_id).await,
+        };
+        if !ok {
+            debug!("heartbeat {} {} -> MISS", req.service, req.node_id);
         }
+        Ok(Response::new(HeartbeatReply { ok }))
     }
 
-    async fn discover(
-        &self,
-        request: Request<DiscoverRequest>,
-    ) -> Result<Response<DiscoverReply>, Status> {
+    async fn discover(&self, request: Request<DiscoverRequest>) -> Result<Response<DiscoverReply>, Status> {
         let req = request.into_inner();
-        let st = self.state.lock().await;
-        let nodes = st
-            .services
-            .get(&req.service)
-            .map(|m| {
-                m.iter()
-                    .map(|(id, n)| NodeInfo {
-                        node_id: id.clone(),
-                        addr: n.addr.clone(),
-                        meta: n.meta.clone(),
+        let nodes = match &self.backend {
+            Backend::Memory(st) => {
+                let st = st.lock().await;
+                st.discover(&req.service)
+            }
+            Backend::Etcd(e) => {
+                e.discover(&req.service)
+                    .await
+                    .into_iter()
+                    .map(|(node_id, v)| NodeInfo {
+                        node_id,
+                        addr: v.addr,
+                        meta: v.meta,
                     })
                     .collect()
-            })
-            .unwrap_or_default();
+            }
+        };
         Ok(Response::new(DiscoverReply { nodes }))
     }
 
-    async fn unregister(
-        &self,
-        request: Request<UnregisterRequest>,
-    ) -> Result<Response<UnregisterReply>, Status> {
+    async fn unregister(&self, request: Request<UnregisterRequest>) -> Result<Response<UnregisterReply>, Status> {
         let req = request.into_inner();
-        let mut st = self.state.lock().await;
-        if let Some(m) = st.services.get_mut(&req.service) {
-            m.remove(&req.node_id);
+        match &self.backend {
+            Backend::Memory(st) => {
+                st.lock().await.remove(&req.service, &req.node_id);
+            }
+            Backend::Etcd(e) => e.unregister(&req.service, &req.node_id).await,
         }
         Ok(Response::new(UnregisterReply { ok: true }))
-    }
-}
-
-/// 后台过期清理：周期扫描移除过期节点
-async fn sweeper(state: Shared, interval: Duration) {
-    let mut tick = tokio::time::interval(interval);
-    loop {
-        tick.tick().await;
-        let now = now_ns();
-        let mut st = state.lock().await;
-        for (svc, nodes) in st.services.iter_mut() {
-            let before = nodes.len();
-            nodes.retain(|_, n| n.expires_at > now);
-            if nodes.len() != before {
-                warn!("{} nodes expired, remaining {}", svc, nodes.len());
-            }
-        }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
 
-    let state: Shared = Arc::new(Mutex::new(RegistryState { services: HashMap::new() }));
-    tokio::spawn(sweeper(state.clone(), Duration::from_secs(1)));
+    let backend = if args.registry.is_empty() {
+        info!("using in-memory registry backend");
+        let mem = SharedMemory::default();
+        {
+            let m = mem.clone();
+            tokio::spawn(async move { memory_backend::sweeper(m, Duration::from_secs(1)).await });
+        }
+        Backend::Memory(mem)
+    } else {
+        let endpoints: Vec<String> = args.registry.split(',').map(|s| s.trim().to_string()).collect();
+        info!("using etcd registry backend at {:?}", endpoints);
+        let etcd = EtcdBackend::connect(endpoints).await?;
+        Backend::Etcd(Arc::new(etcd))
+    };
 
-    let svc = RegistrySvc { state, default_ttl: 10 };
+    let svc = RegistrySvc { backend, default_ttl: 10 };
     info!("registry listening on {}", args.listen);
     Server::builder()
         .add_service(RegistryServiceServer::new(svc))

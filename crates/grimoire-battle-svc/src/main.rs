@@ -35,8 +35,6 @@ struct Args {
     listen: String,
     #[arg(long, default_value = "127.0.0.1:8500")]
     registry: String,
-    #[arg(long, default_value = "127.0.0.1:9100")]
-    gateway: String,
     #[arg(long, default_value = "battle-svc-1")]
     node_id: String,
 }
@@ -197,8 +195,11 @@ impl App {
         if let Some(b) = self.battles.get(&bid) {
             let mut battle = b.value().lock().await;
             battle.remove_player(pid);
-            if battle.players.is_empty() {
-                drop(battle);
+            let empty = battle.players.is_empty();
+            // 先释放 Ref（读锁）再 remove（写锁），否则 DashMap 分片自死锁
+            drop(battle);
+            drop(b);
+            if empty {
                 self.battles.remove(&bid);
             }
         }
@@ -215,7 +216,8 @@ impl App {
                 (battle.snapshot(), battle.players.values().map(|p| p.conn_id).collect::<Vec<_>>())
             };
             for conn in targets {
-                let _ = self.pusher.push(conn, msg::BATTLE_FRAME_SYNC, payload.clone()).await;
+                // 帧同步走 UDP 低延迟通道（客户端绑定 UDP 后由网关转发）
+                let _ = self.pusher.push_udp(conn, msg::BATTLE_FRAME_SYNC, payload.clone()).await;
             }
         }
     }
@@ -290,7 +292,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
-    let pusher = Pusher::connect(&args.gateway).await?;
+    let pusher = Pusher::connect(&args.registry).await?;
     let app = Arc::new(App::new(pusher));
 
     // 20Hz 模拟节拍
