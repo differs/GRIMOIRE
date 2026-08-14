@@ -277,6 +277,9 @@ impl App {
             drop(b);
             if empty {
                 self.battles.remove(&bid);
+                if let Some(sd) = &self.session_dir {
+                    let _ = sd.remove(msg::DOMAIN_BATTLE, bid).await;
+                }
             } else if single {
                 // 满局退成 1 人 → 重新登记大厅等待匹配
                 if let Some(sd) = &self.session_dir {

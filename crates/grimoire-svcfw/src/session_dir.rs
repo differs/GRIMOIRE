@@ -57,6 +57,17 @@ impl SessionDir {
         }
     }
 
+    /// 删除会话目录条目（会话结束 / 节点失效时清理）。
+    pub async fn remove(&self, domain: u32, session_id: u32) {
+        let r: Result<(), redis::RedisError> = redis::cmd("DEL")
+            .arg(key(domain, session_id))
+            .query_async(&mut self.redis.clone())
+            .await;
+        if let Err(e) = r {
+            warn!("session remove {}:{} failed: {}", domain, session_id, e);
+        }
+    }
+
     fn lobby_key(domain: u32) -> String {
         format!("{}lobby:{}", KEY_PREFIX, domain)
     }

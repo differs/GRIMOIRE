@@ -355,6 +355,7 @@ async fn try_matchmake(ctx: &Ctx, domain: u32, msg_id: u32, conn_id: u32) {
 }
 
 /// 会话目录路由：连接绑定了目标玩法域会话时，查目录返回托管节点。
+/// 若托管节点已失效（注册中心不再有它），清理目录/绑定/缓存并返回 None（走兜底路由）。
 async fn session_target_node(ctx: &Ctx, domain: u32, session: &Arc<Session>) -> Option<Arc<grimoire_pb::pb::NodeInfo>> {
     let sd = ctx.session_dir.as_ref()?;
     let (b_domain, sid) = *ctx.conn_session.get(&session.conn_id())?;
@@ -370,12 +371,36 @@ async fn session_target_node(ctx: &Ctx, domain: u32, session: &Arc<Session>) -> 
         if e.1 > now {
             let node_id = e.0.clone();
             drop(e);
-            return ctx.discovery.resolve_by_node_id(domain, &node_id).await;
+            if let Some(n) = ctx.discovery.resolve_by_node_id(domain, &node_id).await {
+                return Some(n);
+            }
+            // 缓存节点已失效 → 走完整失效流程
+            invalidate_session(ctx, domain, session.conn_id(), sid).await;
+            return None;
         }
     }
     let node_id = sd.lookup(domain, sid).await?;
-    ctx.session_cache.insert(cache_key, (node_id.clone(), now + 15_000_000_000));
-    ctx.discovery.resolve_by_node_id(domain, &node_id).await
+    match ctx.discovery.resolve_by_node_id(domain, &node_id).await {
+        Some(n) => {
+            ctx.session_cache.insert(cache_key, (node_id, now + 15_000_000_000));
+            Some(n)
+        }
+        None => {
+            // 托管节点已下线 → 失效该会话
+            invalidate_session(ctx, domain, session.conn_id(), sid).await;
+            None
+        }
+    }
+}
+
+/// 会话失效：清理本地缓存、连接绑定、Redis 目录条目，使玩家可重新匹配。
+async fn invalidate_session(ctx: &Ctx, domain: u32, conn_id: u32, sid: u32) {
+    ctx.conn_session.remove(&conn_id);
+    ctx.session_cache.remove(&(domain, sid));
+    if let Some(sd) = &ctx.session_dir {
+        let _ = sd.remove(domain, sid).await;
+    }
+    warn!("session {}:{} invalidated (host node gone)", domain, sid);
 }
 
 /// 鉴权握手：校验 token，通过则标记会话已鉴权。
@@ -451,6 +476,12 @@ async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
 
     if let Err(e) = result {
         warn!("forward msg 0x{:X} err: {}", frame.msg_id, e);
+        // 若会话绑定的请求转发失败（托管节点不可达）→ 失效该会话，玩家可重新匹配
+        if let Some((d, sid)) = ctx.conn_session.get(&session.conn_id()).map(|v| *v) {
+            if d == domain {
+                invalidate_session(&ctx, domain, session.conn_id(), sid).await;
+            }
+        }
         ctx.streams.pending.remove(&(session.conn_id(), frame.seq));
         let _ = session
             .send(Frame {

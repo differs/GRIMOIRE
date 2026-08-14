@@ -79,6 +79,7 @@ async fn main() -> Result<()> {
     match args.mode.as_str() {
         "room" => room_demo(&args).await?,
         "room-migrate" => room_migrate_demo(&args).await?,
+        "room-hold" => room_hold_demo(&args).await?,
         "battle" => battle_demo(&args).await?,
         "battle-udp" => battle_udp_demo(&args).await?,
         "battle-kcp" => battle_kcp_demo(&args).await?,
@@ -669,6 +670,25 @@ async fn room_migrate_demo(args: &Args) -> Result<()> {
         None => anyhow::bail!("迁移后房间丢失了！"),
     }
     info!("=== room-migrate demo done ===");
+    Ok(())
+}
+
+/// 保持连接模式：登录建房并持续发聊天，用于演示节点宕机时的会话失效与自愈。
+async fn room_hold_demo(args: &Args) -> Result<()> {
+    let a = Client::connect(&args.gateway, 1).await?;
+    let _ = a.request(msg::ROOM_LOGIN, enc(&RoomLoginReq { name: "小明".into() })).await?;
+    let r = a.request(msg::ROOM_CREATE, enc(&RoomCreateReq { name: "持久房".into(), capacity: 8 })).await?;
+    let room = dec::<RoomCreateResp>(&r.payload)?;
+    info!("A created room #{} (holding...)", room.room_id);
+    a.bind_session(msg::DOMAIN_ROOM, room.room_id).await?;
+    for i in 0..args.duration {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        match a.request(msg::ROOM_CHAT, enc(&RoomChatReq { text: format!("tick{}", i).into() })).await {
+            Ok(_) => info!("[{}s] chat ok", i),
+            Err(e) => info!("[{}s] chat FAILED: {}", i, e),
+        }
+    }
+    info!("=== room-hold done ===");
     Ok(())
 }
 

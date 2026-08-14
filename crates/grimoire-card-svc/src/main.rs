@@ -382,6 +382,9 @@ impl App {
                 drop(game);
                 drop(g);
                 self.games.remove(&gid);
+                if let Some(sd) = &self.session_dir {
+                    let _ = sd.remove(msg::DOMAIN_CARD, gid).await;
+                }
             } else if game.phase == PHASE_PLAYING {
                 // 对手退场 → 直接判胜
                 game.phase = PHASE_FINISHED;

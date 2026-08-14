@@ -156,12 +156,12 @@ impl App {
         let app2 = app.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(GRACE_SECS)).await;
-            app2.expire_session(conn_id, gen);
+            app2.expire_session(conn_id, gen).await;
         });
     }
 
     /// 宽限到期清理：移除玩家并（必要时）删除空房间。
-    fn expire_session(&self, conn_id: u32, gen: u64) {
+    async fn expire_session(&self, conn_id: u32, gen: u64) {
         if self.pending_removal.get(&conn_id).map(|g| *g) != Some(gen) {
             return;
         }
@@ -183,6 +183,10 @@ impl App {
         self.players.remove(&conn_id);
         if empty {
             self.rooms.remove(&p.room_id);
+            // 会话目录失效：房间已删除
+            if let Some(sd) = &self.session_dir {
+                let _ = sd.remove(msg::DOMAIN_ROOM, p.room_id).await;
+            }
         }
         warn!("room player {} session expired (grace {}s)", p.player_id, GRACE_SECS);
     }
@@ -234,7 +238,7 @@ impl App {
         Some(RoomJoinResp { room: Some(room.info()) })
     }
 
-    fn leave_room(&self, conn_id: u32) -> bool {
+    async fn leave_room(&self, conn_id: u32) -> bool {
         let p = match self.players.get(&conn_id) {
             Some(r) => r.clone(),
             None => return false,
@@ -248,6 +252,9 @@ impl App {
         if room.members.is_empty() {
             drop(room);
             self.rooms.remove(&p.room_id);
+            if let Some(sd) = &self.session_dir {
+                let _ = sd.remove(msg::DOMAIN_ROOM, p.room_id).await;
+            }
         }
         true
     }
@@ -321,7 +328,7 @@ async fn process(app: &Arc<App>, req: ForwardRequest) -> ForwardReply {
             Err(e) => err(format!("bad payload: {e}")),
         },
         msg::ROOM_LEAVE => {
-            app.leave_room(req.conn_id);
+            app.leave_room(req.conn_id).await;
             reply(encode(&RoomLeaveResp {}))
         }
         msg::ROOM_LIST => reply(encode(&app.list_rooms())),
