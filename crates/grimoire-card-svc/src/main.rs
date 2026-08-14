@@ -166,10 +166,12 @@ struct App {
     next_game: AtomicU32,
     pusher: Pusher,
     store: Option<Arc<grimoire_svcfw::ProfileStore>>,
+    session_dir: Option<Arc<grimoire_svcfw::SessionDir>>,
+    node_id: String,
 }
 
 impl App {
-    fn new(pusher: Pusher, store: Option<Arc<grimoire_svcfw::ProfileStore>>) -> Self {
+    fn new(pusher: Pusher, store: Option<Arc<grimoire_svcfw::ProfileStore>>, session_dir: Option<Arc<grimoire_svcfw::SessionDir>>, node_id: String) -> Self {
         Self {
             games: DashMap::new(),
             conn_game: DashMap::new(),
@@ -177,6 +179,8 @@ impl App {
             next_game: AtomicU32::new(1),
             pusher,
             store,
+            session_dir,
+            node_id,
         }
     }
 
@@ -231,6 +235,10 @@ impl App {
             (idx, state, started)
         };
 
+        // 会话目录：登记本节点托管该对局
+        if let Some(sd) = &self.session_dir {
+            let _ = sd.bind(msg::DOMAIN_CARD, game_id, &self.node_id).await;
+        }
         // 第二人加入后，给先手玩家也推送开局状态
         if started {
             self.push_snapshot(game_id).await;
@@ -510,7 +518,14 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
-    let app = Arc::new(App::new(pusher, store));
+    let session_dir = match grimoire_svcfw::SessionDir::connect(&args.redis_url).await {
+        Ok(sd) => Some(Arc::new(sd)),
+        Err(e) => {
+            warn!("session dir disabled: {}", e);
+            None
+        }
+    };
+    let app = Arc::new(App::new(pusher, store, session_dir, args.node_id.clone()));
 
     grimoire_svcfw::register_and_heartbeat(
         &args.registry,

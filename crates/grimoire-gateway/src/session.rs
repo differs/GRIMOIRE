@@ -41,6 +41,12 @@ pub struct Ctx {
     pub kcp_interval: i32,
     pub kcp_resend: i32,
     pub kcp_nc: bool,
+    /// 会话目录（Redis，可空）
+    pub session_dir: Option<Arc<grimoire_svcfw::SessionDir>>,
+    /// conn_id -> (玩法域, session_id) 会话绑定
+    pub conn_session: Arc<DashMap<u32, (u32, u32)>>,
+    /// (玩法域, session_id) -> (节点ID, 过期纳秒) 本地缓存
+    pub session_cache: Arc<DashMap<(u32, u32), (String, u64)>>,
 }
 
 pub struct Session {
@@ -179,6 +185,9 @@ pub async fn accept_and_serve(ctx: Arc<Ctx>, stream: TcpStream, peer: SocketAddr
             PType::Request if frame.msg_id == msg::SYS_RESUME => {
                 handle_resume(&ctx, &session, conn_id, frame).await;
             }
+            PType::Request if frame.msg_id == msg::SYS_BIND_SESSION => {
+                handle_bind_session(&ctx, &session, frame).await;
+            }
             PType::Request => {
                 let s = session.clone();
                 let c = ctx.clone();
@@ -271,6 +280,51 @@ async fn handle_resume(ctx: &Ctx, session: &Arc<Session>, new_conn_id: u32, fram
         .await;
 }
 
+/// 会话绑定：记录 conn -> (玩法域, session_id)，后续按会话路由到托管节点。
+async fn handle_bind_session(ctx: &Ctx, session: &Arc<Session>, frame: Frame) {
+    let ok = if frame.payload.len() == 5 {
+        let domain = u32::from(frame.payload[0]) << 24;
+        let sid = u32::from_be_bytes([frame.payload[1], frame.payload[2], frame.payload[3], frame.payload[4]]);
+        ctx.conn_session.insert(session.conn_id(), (domain, sid));
+        debug!("conn {} bound to session {}:{}", session.conn_id(), domain, sid);
+        true
+    } else {
+        false
+    };
+    let _ = session
+        .send(Frame {
+            ptype: PType::Response,
+            msg_id: if ok { msg::SYS_BIND_SESSION } else { 0 },
+            seq: frame.seq,
+            payload: Bytes::new(),
+        })
+        .await;
+}
+
+/// 会话目录路由：连接绑定了目标玩法域会话时，查目录返回托管节点。
+async fn session_target_node(ctx: &Ctx, domain: u32, session: &Arc<Session>) -> Option<Arc<grimoire_pb::pb::NodeInfo>> {
+    let sd = ctx.session_dir.as_ref()?;
+    let (b_domain, sid) = *ctx.conn_session.get(&session.conn_id())?;
+    if b_domain != domain {
+        return None;
+    }
+    let cache_key = (domain, sid);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    if let Some(e) = ctx.session_cache.get(&cache_key) {
+        if e.1 > now {
+            let node_id = e.0.clone();
+            drop(e);
+            return ctx.discovery.resolve_by_node_id(domain, &node_id).await;
+        }
+    }
+    let node_id = sd.lookup(domain, sid).await?;
+    ctx.session_cache.insert(cache_key, (node_id.clone(), now + 15_000_000_000));
+    ctx.discovery.resolve_by_node_id(domain, &node_id).await
+}
+
 /// 把客户端请求经流式复用转发到对应玩法服务，取回响应并回写。
 async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
     let domain = msg::domain_of(frame.msg_id);
@@ -278,7 +332,14 @@ async fn forward_request(ctx: Arc<Ctx>, session: Arc<Session>, frame: Frame) {
     let result: Result<(), String> = async {
         let svc_name = crate::discovery::service_for_domain(domain)
             .ok_or_else(|| format!("unknown domain 0x{:X}", domain))?;
-        let node = ctx.discovery.resolve(domain, Some(session.conn_id())).await.ok_or_else(|| format!("no {} available", svc_name))?;
+        // 会话绑定优先：连接已绑定会话时按 Redis 目录路由到托管节点
+        let node = match session_target_node(&ctx, domain, &session).await {
+            Some(n) => n,
+            None => {
+                ctx.discovery.resolve(domain, Some(session.conn_id())).await
+                    .ok_or_else(|| format!("no {} available", svc_name))?
+            }
+        };
         // 首次进入该玩法域时通知业务服务（低频，unary 即可）
         if session.mark_domain(domain) {
             if let Some(ch) = ctx.discovery.channel_for(&node.addr).await {

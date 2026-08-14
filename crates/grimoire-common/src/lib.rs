@@ -16,6 +16,10 @@ pub mod msg {
     /// 系统消息：客户端->网关 连接迁移（断线重连恢复会话）。
     /// payload = 旧 conn_id(4B 大端)；网关把当前连接重绑到旧 conn_id，原连接被踢。
     pub const SYS_RESUME: u32 = 0x0000_FFFE;
+    /// 系统消息：客户端->网关 会话绑定（多实例按会话分片路由）。
+    /// payload = [玩法域 1B][session_id 4B 大端]；之后该连接在对应玩法域的请求
+    /// 按会话查 Redis 目录路由到托管节点。
+    pub const SYS_BIND_SESSION: u32 = 0x0000_FFFD;
 
     pub fn domain_of(msg_id: u32) -> u32 {
         msg_id & DOMAIN_MASK

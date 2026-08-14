@@ -46,6 +46,9 @@ struct Args {
     /// KCP 关闭流控(纯快传模式)
     #[arg(long, default_value = "true")]
     kcp_nc: bool,
+    /// Redis 地址（会话目录）
+    #[arg(long, default_value = "redis://127.0.0.1:6379")]
+    redis: String,
 }
 
 /// gRPC 侧：业务服务主动 push/kick 到客户端连接
@@ -139,6 +142,16 @@ async fn main() -> anyhow::Result<()> {
     let streams = stream::Streams::new(discovery.clone());
     let (udp_tx, mut udp_rx) = tokio::sync::mpsc::channel::<(SocketAddr, Vec<u8>)>(512);
     let udp_sock = Arc::new(tokio::net::UdpSocket::bind(&args.udp_listen).await?);
+    let session_dir = match grimoire_svcfw::SessionDir::connect(&args.redis).await {
+        Ok(sd) => {
+            info!("session directory enabled (redis)");
+            Some(Arc::new(sd))
+        }
+        Err(e) => {
+            warn!("session directory disabled: {}", e);
+            None
+        }
+    };
     let ctx = Arc::new(Ctx {
         sessions: Arc::new(DashMap::new()),
         discovery,
@@ -151,6 +164,9 @@ async fn main() -> anyhow::Result<()> {
         kcp_interval: args.kcp_interval,
         kcp_resend: args.kcp_resend,
         kcp_nc: args.kcp_nc,
+        session_dir,
+        conn_session: Arc::new(DashMap::new()),
+        session_cache: Arc::new(DashMap::new()),
     });
 
     // 注册到注册中心（多活网关按 id 区分）

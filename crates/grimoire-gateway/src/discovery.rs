@@ -145,6 +145,21 @@ impl Discovery {
         }
     }
 
+    /// 按节点 ID 定位具体节点（会话目录路由用）。
+    pub async fn resolve_by_node_id(&self, domain: u32, node_id: &str) -> Option<Arc<NodeInfo>> {
+        let svc_name = service_for_domain(domain)?;
+        let now = now_nanos();
+        let need_fetch = match self.cache.get(&domain) {
+            Some(e) => e.nodes.is_empty() || now.saturating_sub(e.fetched_at) > self.cache_ttl_ns,
+            None => true,
+        };
+        if need_fetch {
+            self.fetch(domain, svc_name).await?;
+        }
+        let e = self.cache.get(&domain)?;
+        e.nodes.iter().find(|n| n.node_id == node_id).cloned()
+    }
+
     /// 获取到某节点地址的 gRPC 通道（懒连接 + 连接池轮询）。
     /// 单条 h2 连接在高并发 unary RPC 下流锁竞争明显，池化后可线性扩展。
     pub async fn channel_for(&self, addr: &str) -> Option<Channel> {

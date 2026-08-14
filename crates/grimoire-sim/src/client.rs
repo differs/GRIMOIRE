@@ -119,6 +119,18 @@ impl Client {
         }
     }
 
+    /// 会话绑定：告知网关本连接归属于某玩法会话（多实例按会话分片路由）。
+    pub async fn bind_session(&self, domain: u32, session_id: u32) -> anyhow::Result<()> {
+        let mut p = vec![(domain >> 24) as u8];
+        p.extend_from_slice(&session_id.to_be_bytes());
+        let r = self.request(msg::SYS_BIND_SESSION, p).await?;
+        if r.msg_id == msg::SYS_BIND_SESSION {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("bind session failed"))
+        }
+    }
+
     /// 发送请求并等待对应响应（5s 超时）。
     pub async fn request(&self, msg_id: u32, payload: Vec<u8>) -> anyhow::Result<Frame> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);

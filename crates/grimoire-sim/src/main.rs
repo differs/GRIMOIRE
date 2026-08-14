@@ -150,7 +150,11 @@ async fn room_demo(args: &Args) -> Result<()> {
     let r = a.request(msg::ROOM_CREATE, enc(&RoomCreateReq { name: "开黑房".into(), capacity: 8 })).await?;
     let room = dec::<RoomCreateResp>(&r.payload)?;
     info!("A created room #{}", room.room_id);
+    a.bind_session(msg::DOMAIN_ROOM, room.room_id).await?;
 
+    // B：先绑定会话再登录 —— 登录/入房都按会话路由到房间所在节点，
+    // 玩家状态与房间同节点（跨实例关键）
+    b.bind_session(msg::DOMAIN_ROOM, room.room_id).await?;
     let r = b.request(msg::ROOM_LOGIN, enc(&RoomLoginReq { name: "小红".into() })).await?;
     let login2 = dec::<RoomLoginResp>(&r.payload)?;
     info!("B logged in player={}", login2.player_id);
@@ -179,6 +183,9 @@ async fn battle_demo(args: &Args) -> Result<()> {
     let r = a.request(msg::BATTLE_JOIN, vec![]).await?;
     let ja = dec::<BattleJoinResp>(&r.payload)?;
     info!("A joined battle#{} as player {} ({}Hz)", ja.battle_id, ja.player_id, ja.frame_rate);
+    a.bind_session(msg::DOMAIN_BATTLE, ja.battle_id).await?;
+    // B 加入前绑定到同一战斗 → 按会话路由到 A 所在节点（跨实例撮合）
+    b.bind_session(msg::DOMAIN_BATTLE, ja.battle_id).await?;
     let r = b.request(msg::BATTLE_JOIN, vec![]).await?;
     let jb = dec::<BattleJoinResp>(&r.payload)?;
     info!("B joined battle#{} as player {}", jb.battle_id, jb.player_id);
@@ -216,6 +223,8 @@ async fn battle_udp_demo(args: &Args) -> Result<()> {
 
     let r = a.request(msg::BATTLE_JOIN, vec![]).await?;
     let ja = dec::<BattleJoinResp>(&r.payload)?;
+    a.bind_session(msg::DOMAIN_BATTLE, ja.battle_id).await?;
+    b.bind_session(msg::DOMAIN_BATTLE, ja.battle_id).await?;
     let r = b.request(msg::BATTLE_JOIN, vec![]).await?;
     let jb = dec::<BattleJoinResp>(&r.payload)?;
     info!("A player {} joined battle#{}, B player {} joined ({}Hz)",
@@ -283,6 +292,8 @@ async fn battle_kcp_demo(args: &Args) -> Result<()> {
 
     let r = a.request(msg::BATTLE_JOIN, vec![]).await?;
     let ja = dec::<BattleJoinResp>(&r.payload)?;
+    a.bind_session(msg::DOMAIN_BATTLE, ja.battle_id).await?;
+    b.bind_session(msg::DOMAIN_BATTLE, ja.battle_id).await?;
     let r = b.request(msg::BATTLE_JOIN, vec![]).await?;
     let jb = dec::<BattleJoinResp>(&r.payload)?;
     info!("A player {} joined battle#{}, B player {} joined ({}Hz)",
@@ -361,9 +372,13 @@ async fn battle_stress_demo(args: &Args) -> Result<()> {
         }
         v
     };
-    // 全部入局
+    // 全部入局 + 绑定会话（按 battle 路由后续输入）
     for c in &clients {
-        let _ = c.request(msg::BATTLE_JOIN, vec![]).await;
+        if let Ok(r) = c.request(msg::BATTLE_JOIN, vec![]).await {
+            if let Ok(j) = dec::<BattleJoinResp>(&r.payload) {
+                let _ = c.bind_session(msg::DOMAIN_BATTLE, j.battle_id).await;
+            }
+        }
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     info!("joined {} clients", clients.len());
@@ -470,6 +485,10 @@ async fn card_demo(args: &Args) -> Result<()> {
     let r = a.request(msg::CARD_START, vec![]).await?;
     let sa = dec::<CardStartResp>(&r.payload)?;
     info!("A started, hand: {}", fmt_hand(sa.state.as_ref()));
+    let gid = sa.state.as_ref().map(|st| st.game_id).unwrap_or(0);
+    a.bind_session(msg::DOMAIN_CARD, gid).await?;
+    // B 加入前绑定到同一对局 → 按会话路由到 A 所在节点
+    b.bind_session(msg::DOMAIN_CARD, gid).await?;
     let r = b.request(msg::CARD_START, vec![]).await?;
     let sb = dec::<CardStartResp>(&r.payload)?;
     info!("B started, hand: {}", fmt_hand(sb.state.as_ref()));
@@ -550,8 +569,11 @@ async fn room_migrate_demo(args: &Args) -> Result<()> {
     let r = a.request(msg::ROOM_CREATE, enc(&RoomCreateReq { name: "开黑房".into(), capacity: 8 })).await?;
     let room = dec::<RoomCreateResp>(&r.payload)?;
     info!("A created room #{}", room.room_id);
+    a.bind_session(msg::DOMAIN_ROOM, room.room_id).await?;
 
     let b = Client::connect(&args.gateway_b, 2).await?;
+    // B 先绑定再登录，保证玩家与房间同节点
+    b.bind_session(msg::DOMAIN_ROOM, room.room_id).await?;
     let r = b.request(msg::ROOM_LOGIN, enc(&RoomLoginReq { name: "小红".into() })).await?;
     let login_b = dec::<RoomLoginResp>(&r.payload)?;
     let _ = b.request(msg::ROOM_JOIN, enc(&RoomJoinReq { room_id: room.room_id })).await?;
@@ -568,6 +590,8 @@ async fn room_migrate_demo(args: &Args) -> Result<()> {
     a2.resume(a_cid).await?;
     info!("A resumed: conn {} -> {}", new_cid, a2.conn_id());
     a2.start_heartbeat();
+    // 新连接需重新绑定会话
+    a2.bind_session(msg::DOMAIN_ROOM, room.room_id).await?;
 
     // 重新登录：应返回相同 player_id（会话未丢失）
     let r = a2.request(msg::ROOM_LOGIN, enc(&RoomLoginReq { name: "小明".into() })).await?;

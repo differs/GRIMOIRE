@@ -69,10 +69,13 @@ struct App {
     pusher: Pusher,
     /// 持久化存储（可空）
     store: Option<Arc<grimoire_svcfw::ProfileStore>>,
+    /// 会话目录（Redis，可空）
+    session_dir: Option<Arc<grimoire_svcfw::SessionDir>>,
+    node_id: String,
 }
 
 impl App {
-    fn new(pusher: Pusher, store: Option<Arc<grimoire_svcfw::ProfileStore>>) -> Self {
+    fn new(pusher: Pusher, store: Option<Arc<grimoire_svcfw::ProfileStore>>, session_dir: Option<Arc<grimoire_svcfw::SessionDir>>, node_id: String) -> Self {
         Self {
             players: DashMap::new(),
             rooms: DashMap::new(),
@@ -81,6 +84,8 @@ impl App {
             pending_removal: DashMap::new(),
             pusher,
             store,
+            session_dir,
+            node_id,
         }
     }
 
@@ -182,7 +187,7 @@ impl App {
         warn!("room player {} session expired (grace {}s)", p.player_id, GRACE_SECS);
     }
 
-    fn create_room(&self, conn_id: u32, name: String, capacity: u32) -> Option<RoomCreateResp> {
+    async fn create_room(&self, conn_id: u32, name: String, capacity: u32) -> Option<RoomCreateResp> {
         // 注意：必须先 clone 出 owned 数据并释放 DashMap Ref，
         // 否则下面再对同一分片 get_mut 会自死锁
         let p = match self.players.get(&conn_id) {
@@ -201,11 +206,15 @@ impl App {
         };
         self.rooms.insert(room_id, room.clone());
         self.players.get_mut(&conn_id).unwrap().room_id = room_id;
+        // 会话目录：登记本节点托管该房间
+        if let Some(sd) = &self.session_dir {
+            let _ = sd.bind(msg::DOMAIN_ROOM, room_id, &self.node_id).await;
+        }
         debug!("room {} created by {}", room_id, p.player_id);
         Some(RoomCreateResp { room_id })
     }
 
-    fn join_room(&self, conn_id: u32, room_id: u32) -> Option<RoomJoinResp> {
+    async fn join_room(&self, conn_id: u32, room_id: u32) -> Option<RoomJoinResp> {
         let p = match self.players.get(&conn_id) {
             Some(r) => r.clone(),
             None => return None,
@@ -219,6 +228,9 @@ impl App {
         }
         room.members.push(p.clone());
         self.players.get_mut(&conn_id).unwrap().room_id = room_id;
+        if let Some(sd) = &self.session_dir {
+            let _ = sd.bind(msg::DOMAIN_ROOM, room_id, &self.node_id).await;
+        }
         Some(RoomJoinResp { room: Some(room.info()) })
     }
 
@@ -288,14 +300,14 @@ async fn process(app: &Arc<App>, req: ForwardRequest) -> ForwardReply {
             Err(e) => err(format!("bad payload: {e}")),
         },
         msg::ROOM_CREATE => match dec::<RoomCreateReq>(&req.payload) {
-            Ok(m) => match app.create_room(req.conn_id, m.name, m.capacity) {
+            Ok(m) => match app.create_room(req.conn_id, m.name, m.capacity).await {
                 Some(r) => reply(encode(&r)),
                 None => err("已在房间中".into()),
             },
             Err(e) => err(format!("bad payload: {e}")),
         },
         msg::ROOM_JOIN => match dec::<RoomJoinReq>(&req.payload) {
-            Ok(m) => match app.join_room(req.conn_id, m.room_id) {
+            Ok(m) => match app.join_room(req.conn_id, m.room_id).await {
                 Some(r) => {
                     // 克隆出房间再 await 广播，Ref 绝不跨 await
                     let room = app.rooms.get(&m.room_id).map(|r| r.clone());
@@ -458,7 +470,14 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
-    let app = Arc::new(App::new(pusher, store));
+    let session_dir = match grimoire_svcfw::SessionDir::connect(&args.redis_url).await {
+        Ok(sd) => Some(Arc::new(sd)),
+        Err(e) => {
+            warn!("session dir disabled: {}", e);
+            None
+        }
+    };
+    let app = Arc::new(App::new(pusher, store, session_dir, args.node_id.clone()));
 
     grimoire_svcfw::register_and_heartbeat(
         &args.registry,

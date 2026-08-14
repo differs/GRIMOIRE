@@ -22,7 +22,7 @@ use grimoire_pb::pb::{
 use grimoire_svcfw::Pusher;
 use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const FRAME_RATE: u32 = 20; // Hz
 const SPEED: f32 = 8.0; // 单位/秒
@@ -37,6 +37,8 @@ struct Args {
     registry: String,
     #[arg(long, default_value = "battle-svc-1")]
     node_id: String,
+    #[arg(long, default_value = "redis://127.0.0.1:6379")]
+    redis_url: String,
 }
 
 #[derive(Clone)]
@@ -116,16 +118,20 @@ struct App {
     next_player: AtomicU32,
     next_battle: AtomicU32,
     pusher: Pusher,
+    session_dir: Option<Arc<grimoire_svcfw::SessionDir>>,
+    node_id: String,
 }
 
 impl App {
-    fn new(pusher: Pusher) -> Self {
+    fn new(pusher: Pusher, session_dir: Option<Arc<grimoire_svcfw::SessionDir>>, node_id: String) -> Self {
         Self {
             battles: DashMap::new(),
             conn_battle: DashMap::new(),
             next_player: AtomicU32::new(1),
             next_battle: AtomicU32::new(1),
             pusher,
+            session_dir,
+            node_id,
         }
     }
 
@@ -164,6 +170,10 @@ impl App {
         let resp = self.join_resp(target_id, player_id, &battle);
         drop(battle);
         self.conn_battle.insert(conn_id, (target_id, player_id));
+        // 会话目录：登记本节点托管该战斗
+        if let Some(sd) = &self.session_dir {
+            let _ = sd.bind(msg::DOMAIN_BATTLE, target_id, &self.node_id).await;
+        }
         info!("battle {} joined by player {}", target_id, player_id);
         resp
     }
@@ -346,7 +356,14 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let pusher = Pusher::connect(&args.registry).await?;
-    let app = Arc::new(App::new(pusher));
+    let session_dir = match grimoire_svcfw::SessionDir::connect(&args.redis_url).await {
+        Ok(sd) => Some(Arc::new(sd)),
+        Err(e) => {
+            warn!("session dir disabled: {}", e);
+            None
+        }
+    };
+    let app = Arc::new(App::new(pusher, session_dir, args.node_id.clone()));
 
     // 20Hz 模拟节拍
     let ticker = app.clone();
