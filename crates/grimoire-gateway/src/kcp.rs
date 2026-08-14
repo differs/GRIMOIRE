@@ -3,6 +3,7 @@
 //! 与裸 UDP 通道并存，按数据报首字节自动识别：
 //!   - 以 'MU' 开头 → 裸 UDP（既有 battle-udp 通道）
 //!   - 其他 → KCP 包（前 4 字节 = conv = conn_id）
+//!
 //! KCP 会话以 conn_id 为键；会话内部载荷仍是 peer_packet 格式。
 
 use std::io::Write;

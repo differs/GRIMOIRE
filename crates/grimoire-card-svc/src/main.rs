@@ -115,7 +115,7 @@ impl CardGame {
     /// 对局是否结束
     fn check_finish(&mut self) {
         for p in &self.players {
-            if p.hp <= 0 {
+            if p.hp == 0 {
                 self.phase = PHASE_FINISHED;
                 self.winner = self.players.iter().find(|o| o.player_id != p.player_id).map(|o| o.player_id).unwrap_or(0);
                 return;

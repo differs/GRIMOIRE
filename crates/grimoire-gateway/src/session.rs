@@ -541,7 +541,7 @@ pub async fn handle_kcp_datagram(ctx: Arc<Ctx>, conv: u32, src: SocketAddr, data
 /// UDP 输入转发（一次性，不回响应；seq=0 的响应会被 reader 丢弃）。
 async fn forward_udp(ctx: Arc<Ctx>, session: Arc<Session>, msg_id: u32, payload: Bytes) {
     let domain = msg::domain_of(msg_id);
-    let Ok(svc_name) = crate::discovery::service_for_domain(domain).ok_or_else(|| "unknown domain") else {
+    let Ok(svc_name) = crate::discovery::service_for_domain(domain).ok_or("unknown domain") else {
         return;
     };
     let Some(node) = ctx.discovery.resolve(domain, Some(session.conn_id())).await else {

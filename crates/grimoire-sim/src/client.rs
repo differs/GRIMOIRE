@@ -301,13 +301,8 @@ impl UdpKcp {
             loop {
                 tick.tick().await;
                 // 1) UDP 数据包喂给 KCP
-                loop {
-                    match sock2.try_recv_from(&mut buf) {
-                        Ok((n, _)) => {
-                            let _ = k2.lock().unwrap().input(&buf[..n]);
-                        }
-                        Err(_) => break,
-                    }
+                while let Ok((n, _)) = sock2.try_recv_from(&mut buf) {
+                    let _ = k2.lock().unwrap().input(&buf[..n]);
                 }
                 // 2) 时钟驱动 + 排空应用数据
                 let mut received = Vec::new();

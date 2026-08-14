@@ -683,7 +683,7 @@ async fn room_hold_demo(args: &Args) -> Result<()> {
     a.bind_session(msg::DOMAIN_ROOM, room.room_id).await?;
     for i in 0..args.duration {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        match a.request(msg::ROOM_CHAT, enc(&RoomChatReq { text: format!("tick{}", i).into() })).await {
+        match a.request(msg::ROOM_CHAT, enc(&RoomChatReq { text: format!("tick{}", i) })).await {
             Ok(_) => info!("[{}s] chat ok", i),
             Err(e) => info!("[{}s] chat FAILED: {}", i, e),
         }
@@ -736,7 +736,7 @@ async fn bench(args: &Args) -> Result<()> {
                         n += 1;
                         counter.fetch_add(1, AtOrder::Relaxed);
                         // 采样：每 100 个锁一次共享 lats，降低聚合开销
-                        if n % 100 == 0 {
+                        if n.is_multiple_of(100) {
                             lats.lock().await.push(lat);
                         }
                     }
